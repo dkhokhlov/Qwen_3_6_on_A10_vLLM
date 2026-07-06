@@ -128,7 +128,7 @@ def main():
     print(f"# growing coding session: {args.turns} turns, "
           f"~{args.input_tokens} tok input/turn, {args.max_tokens} tok output/turn, "
           f"model={args.model}")
-    header = (f"{'turn':>4} {'prompt':>7} {'cached':>7} {'uncached':>8} "
+    header = (f"{'turn':>4} {'prompt':>7} {'seq':>7} {'cached':>7} {'uncached':>8} "
               f"{'ttft_s':>7} {'prefill_tps':>11} {'out_tps':>8} {'lat_s':>6} {'hit%':>5}")
     print(header)
     print("-" * len(header))
@@ -157,8 +157,9 @@ def main():
         prefill_tps = (uncached / ttft) if ttft > 1e-6 else 0.0
         out_tps = comp_tok / gen_dur
         hit_pct = (100.0 * cached / prompt_tok) if prompt_tok else 0.0
+        seq_tok = prompt_tok + comp_tok
 
-        print(f"{turn:>4} {prompt_tok:>7} {cached:>7} {uncached:>8} "
+        print(f"{turn:>4} {prompt_tok:>7} {seq_tok:>7} {cached:>7} {uncached:>8} "
               f"{ttft:>7.2f} {prefill_tps:>11.1f} {out_tps:>8.1f} "
               f"{res['t_total']:>6.1f} {hit_pct:>4.0f}")
         sys.stdout.flush()
