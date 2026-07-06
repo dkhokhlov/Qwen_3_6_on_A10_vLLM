@@ -11,8 +11,11 @@ linear-attention) AWQ INT4 checkpoint, served text-only.
 
 ```
 make            # help (default)
-make run        # docker compose up -d  (vllm + open-webui)
-make profile    # growing coding-session bench (override: make profile TURNS=8)
+make run        # docker compose up  (foreground; Ctrl-C to stop)
+make start      # docker compose up -d  (detached)
+make stop       # docker compose stop
+make bench      # growing coding-session bench to ~64k context (override: TURNS=N)
+make bench_pcie # GPU<->host PCIe bandwidth (free GPU needed: make stop first)
 ```
 
 The bench (`scripts/coding_session_bench.py`) streams a chat that grows one
@@ -90,7 +93,7 @@ turn  prompt     seq  cached uncached  ttft_s prefill_tps  out_tps  lat_s  hit%
 
 ### Long context — speed at full 64k context (27-turn run)
 
-`make profile TURNS=27` grows the session to seq 63924 ≈ the 64k ceiling.
+`make bench` grows the session to seq 63924 ≈ the 64k ceiling.
 Condensed (every 8th turn + the final turn):
 
 ```
@@ -122,6 +125,43 @@ Two distinct degradation curves:
 
 Net: the model stays usable at full context. Decode (~19.6 tps, was 21.9) drives
 ~25.5s of the 30.5s turn; prefill of the new turn adds ~5s TTFT (was 1.8s).
+
+## PCIe bandwidth — grounding the TP=2-on-x4 question
+
+`make bench_pcie` (`scripts/pcie_bw_bench.py`) measures GPU↔host cudaMemcpy
+bandwidth on this box and bounds the TP=2 all-reduce cost on the x4 link. The
+A10 negotiates **Gen4 x4** (max x16; the slot/wiring caps it at x4). Measured
+steady-state (large payloads, pinned + non_blocking):
+
+```
+H2D ~6.65 GB/s   D2H ~6.59 GB/s   (~84% of Gen4 x4 line rate ~7.9 GB/s)
+```
+
+Why a 1-GPU test bounds a 2-GPU TP=2 conclusion: NCCL's all-reduce uses P2P
+(best case) or SHM fallback (worst case, if P2P is blocked by ACS/topology).
+The SHM fallback's per-hop cost is exactly a cudaMemcpy D2H/H2D — measurable
+here. P2P does one link hop (GPU0→GPU1); SHM does two (D2H+H2D). So the SHM
+number is the conservative upper bound, and P2P is ~half of it.
+
+TP=2 all-reduce volume (model geometry from `config.json`: hidden=5120,
+layers=64, fp16). Per-layer tensor = 10 KiB at decode batch=1; one-way volume
+= 64 × 10 KiB = 640 KiB/token (decode), 1.31 GB for a 2k-token prefill.
+
+| | SHM fallback (worst) | P2P (≈half) |
+|---|---|---|
+| decode (47 ms step) | **0.43%** (203 µs) | ~0.2% |
+| prefill 2k (2.0 s) | **19.8%** (396 ms) | ~10% |
+
+**Conclusion:** on x4, TP=2 all-reduce is negligible for decode (<0.5%) — the
+>20-tps goal is unhurt by comm; the HBM-read parallelism (each GPU reads half
+the weights) is what gives ~2× decode. Prefill pays a real ~10–20% comm tax
+on x4 (1026 → ~850–870 prefill tps). The decisive unknown that this test
+cannot resolve on a 1-GPU box is whether NCCL selects P2P or SHM on the
+2-GPU board — confirm with `NCCL_DEBUG=INFO` when running TP=2 for real.
+
+Caveat: PCIe ASPM downshifts the link to Gen1 when idle; `nvidia-smi` queried
+at rest reports Gen1. The script warms the link first so the reported gen
+matches the achieved bandwidth (Gen4).
 
 ## Experiments that did NOT work (do not retry without reason)
 

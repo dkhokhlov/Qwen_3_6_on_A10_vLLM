@@ -2,15 +2,24 @@
 
 PY      ?= python3
 BENCH   ?= scripts/coding_session_bench.py
-TURNS   ?= 8
+TURNS   ?= 27  # reaches ~64k seq (full context): ~2k input + ~500 output/turn
 
-.PHONY: help run profile
+.PHONY: help run start stop bench bench_pcie
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-run: ## Start the vLLM + open-webui stack (detached)
+run: ## Start the stack in the foreground (console, Ctrl-C to stop)
+	docker compose up
+
+start: ## Start the stack detached (background)
 	docker compose up -d
 
-profile: ## Run the growing coding-session bench (override with TURNS=N)
+stop: ## Stop the stack (containers kept, not removed)
+	docker compose stop
+
+bench: ## Run the growing coding-session bench (override with TURNS=N)
 	$(PY) $(BENCH) --turns $(TURNS)
+
+bench_pcie: ## Measure GPU<->host PCIe bandwidth (free GPU needed: `make stop` first)
+	$(PY) scripts/pcie_bw_bench.py
