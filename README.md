@@ -88,6 +88,41 @@ turn  prompt     seq  cached uncached  ttft_s prefill_tps  out_tps  lat_s  hit%
   prompt is one partial block with nothing to match. This is coarser than ollama's
   small-segment cache, which is why tiny prompts hit on ollama but not here.
 
+### Long context — speed at full 64k context (27-turn run)
+
+`make profile TURNS=27` grows the session to seq 63924 ≈ the 64k ceiling.
+Condensed (every 8th turn + the final turn):
+
+```
+turn  prompt   out     seq  cached uncached  ttft_s prefill_tps  out_tps  lat_s  hit%
+   1    1885   474    2359       0     1885    1.84      1026.5     21.9   23.5    0
+   8   18369   500   18869   16000     2369    2.96       801.7     20.9   26.8   87
+  17   39704   500   40204   36800     2904    4.49       646.2     20.2   29.2   93
+  27   63424   500   63924   60800     2624    4.99       525.8     19.6   30.5   96
+```
+
+`lat_s = TTFT + out/out_tps`. At turn 27: `4.99 + 500/19.6 = 30.5s`, so **decode
+is ~84% of latency** even at max context. Latency grows 23.5 → 30.5s (+30%) across
+2k → 64k context — modest, because the dominant decode term barely moves.
+
+Two distinct degradation curves:
+
+- **Decode (`out_tps`) 21.9 → 19.6, only ~10% slower at 64k.** Per decode step the
+  16 full-attention layers attend over the growing KV (O(context)/token), but the
+  48 linear-attention (GatedDeltaNet) layers are O(1)/step (fixed state). 75% of
+  layers are cheap → decode stays near the HBM-bandwidth ceiling. This is the
+  hybrid architecture paying off at long context.
+- **Prefill (`prefill_tps`) 1026 → 526, ~49% slower at 64k.** Prefilling the
+  ~2.6k uncached new-turn tokens, those same 16 full-attention layers attend over
+  the *entire 63k cached prefix* per new token → O(context × uncached) work. So
+  prefix caching keeps the *work* bounded to the new turn (~2.6k tokens) even at
+  64k, but the *rate* on that work halves as context grows.
+- **Prefix caching holds at long context**: hit 96% at 64k (cached = 60,800 =
+  76 × 800-token blocks); only the new turn is prefilled.
+
+Net: the model stays usable at full context. Decode (~19.6 tps, was 21.9) drives
+~25.5s of the 30.5s turn; prefill of the new turn adds ~5s TTFT (was 1.8s).
+
 ## Experiments that did NOT work (do not retry without reason)
 
 ### MTP speculative decoding — does not fit on this GPU
