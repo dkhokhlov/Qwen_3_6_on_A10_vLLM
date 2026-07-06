@@ -239,6 +239,27 @@ no NVLink between A10s, so the question is whether TP=2 still pays off. The PCIe
 grounding above says **yes for decode** (all-reduce <0.5% of the step); prefill
 pays ~10–20%.
 
+### Footprint: MTP + visual are downloaded, not loaded
+
+The Qwen3.6-35B-A3B checkpoint ships with a **visual branch** (`vision_config`,
+depth 27, hidden 1152, ~1–1.5 GiB) and an **MTP head** (`mtp_num_hidden_layers=1`,
+~0.1–0.34 GiB). Both inflate the **download**, not the **VRAM footprint** — they
+are cut at load:
+
+| component | on disk | in VRAM | cut by |
+|---|---|---|---|
+| visual branch | ~1–1.5 GiB | no | `--language-model-only` prefix-filters visual weights |
+| MTP head | ~0.1–0.34 GiB | no | default `speculative_config=None` → `skip_prefixes=["mtp."]` (opt-in via `--speculative-config`) |
+| language model | yes | **yes** | — |
+
+**VRAM goes to the language-model weights + KV/state caches only.** Caveat:
+`--language-model-only` skips *loading* visual weights but vLLM still *constructs*
+the visual module (`self.visual = Qwen3_VisionTransformer`), so a checkpoint that
+**quantized** the visual branch asserts at construction (the mattbucci-CT trap —
+see [Experiments](#experiments-that-did-not-work-do-not-retry-without-reason)). MTP,
+if opted in, OOMs on a 23 GB card (drafter head ~340 MiB, <220 MiB free) — needs a
+≥40 GB GPU.
+
 ```
                        single host — A10s have NO NVLink
   ┌─────────────────────────────────────────────────────────────┐
