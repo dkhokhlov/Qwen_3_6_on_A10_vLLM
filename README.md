@@ -21,11 +21,6 @@ model both fit on 24GB at near-FP16 quality. vLLM's Marlin kernel keeps them
 packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 [AWQ quantization — the method, and why both models use it](#awq-quantization--the-method-and-why-both-models-use-it).
 
-- vLLM OpenAI API: `http://localhost:8000/v1`
-  - 27B served-model-name: `qwen3.6-27b`
-  - 35B MoE served-model-name: `qwen3.6-35b-a3b`
-- open-webui: `http://localhost:3000/`
-
 ## TOC
 
 - [Quick Start](#quick-start)
@@ -62,6 +57,11 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 `run35`/`start35`/`stop35` target the 35B MoE stack (`docker-compose.moe.yaml`).
 The two stacks use the same port (8000) and container name prefix, so stop one
 before starting the other.
+
+- vLLM OpenAI API: `http://localhost:8000/v1`
+  - 27B served-model-name: `qwen3.6-27b`
+  - 35B MoE served-model-name: `qwen3.6-35b-a3b`
+- open-webui: `http://localhost:3000/`
 
 The coding-session bench (`scripts/coding_session_bench.py`) streams a chat that
 grows one ~2k-token user message + ~500-token assistant reply per turn and
