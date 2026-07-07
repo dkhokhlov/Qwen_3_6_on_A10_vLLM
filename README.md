@@ -11,8 +11,8 @@ Configs and measurements for both Qwen3.6 checkpoints on a single
   context with 2.2 GiB UVA CPU offload**, output `15.4tps` flat to max context.
 
 **The bigger MoE serves *more* context than the smaller dense model** — 128k vs
-64k — because MoE has far fewer active params per token and a smaller KV per
-token. The MoE's 35B weights don't fit without offload; the dense 27B fits
+64k — because MoE has a smaller KV per token (fewer full-attn layers, smaller
+hidden dim). The MoE's 35B weights don't fit without offload; the dense 27B fits
 cleanly. See [Dense vs MoE — why the bigger model serves more context](#dense-vs-moe--why-the-bigger-model-serves-more-context).
 
 - vLLM OpenAI API: `http://localhost:8000/v1`
@@ -108,7 +108,7 @@ context" intuition:
 | active params / token | 27B (every MLP runs) | 3B (only routed experts run) | MoE: lighter compute, but **irrelevant to context** (context is KV-bound, not compute-bound) |
 | full-attn layers | 16 | 10 (1-in-4) | MoE has fewer layers attending over the prefix |
 | hidden dim | 5120 | 2048 | MoE KV head is 4× smaller per layer |
-| **KV + state per token** | **~11.7 KiB** (large) | **~11 KiB** (but far fewer full-attn tokens) | MoE pays less context cost per token |
+| **KV + state per token** | **~35 KiB** (large; ~3× MoE) | **~11 KiB** (but far fewer full-attn tokens) | MoE pays less context cost per token |
 | weights on GPU | 18.83 GiB (fits) | ~21.5 GiB (does **not** fit) | MoE must offload 2.2 GiB |
 
 The dense 27B is **param-light enough to fit cleanly** (18.83 GiB leaves 3.23
@@ -612,8 +612,9 @@ The 2×A10 MoE projection's reasoning:
   and the 100 %-CPU offloader thread.
 - **Decode rises from 15.4 to ~20–24 tps — a heuristic, not a formula output.**
   The dense `BW / weights_read × 0.7` model does **not** transfer to a sparse
-  MoE: plugging the active read (~3B params = **~1.4 GiB/token total**, ~0.7
-  GiB/GPU under TP=2) into it gives an absurd ~260 tps. The active read is too
+  MoE: plugging the active read into it gives an absurd result either way —
+  ~260–280 tps at the 1× total (~1.4–1.5 GiB/token), ~560 tps at the TP=2
+  per-GPU read (~0.7 GiB). The active read is too
   small to be memory-bandwidth-bound at batch=1 — 1× MoE reads only ~1.5
   GiB/token yet manages 15.4 tps (implies ~23 GiB/s, ~4 % of the A10's ~600
   GB/s GDDR6), so decode is **stall-/overhead-bound** (UVA PCIe stalls +
@@ -727,8 +728,9 @@ param-bound). Do not retry without reason.
 ## Hardware ceiling facts
 
 - **120k no-offload is impossible on this A10 for the dense 27B**: 22.06 −
-  18.83 = 3.23 GiB max cache; 120k needs ~3.55 GiB. Hard upper bound ~72–80k
-  tokens (FP16 state cache).
+  18.83 = 3.23 GiB free; at the measured ~35 KiB/token, 120k needs ~4.0 GiB —
+  over budget. Hard upper bound ~72–80k tokens (FP16 state; the bare per-token
+  rate allows ~95k, but non-KV overhead lowers the real ceiling).
 - **The MoE 35B is param-bound without offload** — weights 21.38 + reserve 0.44
   = 21.82 GiB > the 21.40 GiB achievable at util 0.97. No amount of context fits
   without `--cpu-offload-gb`; 2.2 GiB offload lifts it to 128k.
