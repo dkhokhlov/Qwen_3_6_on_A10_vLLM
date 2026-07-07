@@ -15,6 +15,12 @@ Configs and measurements for both Qwen3.6 checkpoints on a single
 hidden dim). The MoE's 35B weights don't fit without offload; the dense 27B fits
 cleanly. See [Dense vs MoE — why the bigger model serves more context](#dense-vs-moe--why-the-bigger-model-serves-more-context).
 
+**Both checkpoints are AWQ-INT4** — activation-aware 4-bit quantization (group
+128, asymmetric), not naive round-to-nearest — which is why a 27B and a 35B
+model both fit on 24GB at near-FP16 quality. vLLM's Marlin kernel keeps them
+packed-INT4 through serving, ~3–4× faster to decode than FP16. See
+[AWQ quantization — the method, and why both models use it](#awq-quantization--the-method-and-why-both-models-use-it).
+
 - vLLM OpenAI API: `http://localhost:8000/v1`
   - 27B served-model-name: `qwen3.6-27b`
   - 35B MoE served-model-name: `qwen3.6-35b-a3b`
@@ -27,6 +33,7 @@ cleanly. See [Dense vs MoE — why the bigger model serves more context](#dense-
 - [TL;DR — one A10, both models](#tldr--one-a10-both-models)
 - [Dense vs MoE — why the bigger model serves more context](#dense-vs-moe--why-the-bigger-model-serves-more-context)
 - [Hardware](#hardware)
+- [AWQ quantization — the method, and why both models use it](#awq-quantization--the-method-and-why-both-models-use-it)
 - [Deployment A — Qwen3.6-27B-AWQ (Dense)](#deployment-a--qwen36-27b-awq-dense)
 - [Deployment B — Qwen3.6-35B-A3B-AWQ (MoE)](#deployment-b--qwen36-35b-a3b-awq-moe)
 - [Prefix caching](#prefix-caching)
@@ -157,6 +164,86 @@ it persists into serving, not load-only — but the penalty is ~15 tps, not 2 tp
 A second A10 on the same host would lift both ceilings and remove the MoE
 offload tax — see [Two A10 cards — TP=2 projections](#two-a10-cards--tp2-projections-for-dense-and-moe).
 
+## AWQ quantization — the method, and why both models use it
+
+Both Qwen3.6 checkpoints served here are **AWQ-INT4** (verified in each
+`config.json`: `quant_method: awq`, `bits: 4`, `group_size: 128`, asymmetric
+zero-points) running on vLLM's **Marlin** kernel. This is the single biggest
+reason a 27B and a 35B model both fit on 24GB at near-FP16 quality — and it is
+strictly better than naive (static) INT4.
+
+### The loss problem: INT4 is coarse, and round-to-nearest wastes the budget
+
+INT4 gives each weight one of **16 levels**. Rounding a continuous FP16 weight
+into 16 buckets is inherently lossy, so the question is *where* you accept the
+error. **Static / round-to-nearest (RTN)** quantization treats every channel the
+same — but a model's accuracy is carried disproportionately by a small (~0.1 %)
+set of **salient** weight channels (outliers). RTN rounds those high-value
+channels just as coarsely as the rest, so the error lands exactly where it hurts
+most. At INT4, RTN alone collapses accuracy; staying usable usually means keeping
+so many layers in FP16 that you lose most of the memory win.
+
+### AWQ's idea: protect the salient channels with a cheap per-channel scale
+
+AWQ (Activation-aware Weight Quantization, Lin et al. 2023) finds the salient
+channels from the **activations** that run through them — measured on a small
+calibration set — rather than from the weights alone. It protects them not by
+keeping them in FP16 (expensive) but by applying a **per-channel scale `s`**:
+multiply the salient weight channels by `s` (so their fine values survive INT4
+rounding) and divide the matching activations by `s` (the math is identical). The
+rounding error is pushed onto the unimportant channels, where it is harmless.
+The whole tensor stays INT4; only a small per-group scale + zero-point is added
+(here, group size 128).
+
+### How the checkpoint is produced
+
+1. **Calibrate** — run a few hundred representative prompts through the FP16
+   model; record per-channel activation magnitudes.
+2. **Scale search** — for each linear layer, grid-search the per-channel scale
+   `s` that minimizes output reconstruction error (activation-magnitude-weighted).
+3. **Quantize** — apply the scales (`W·s`, quantize; activations get `÷s`), pack
+   to INT4 with group-128 scales + zero-points (asymmetric).
+4. **Protect** — keep a small allowlist in FP16 (`modules_to_not_convert`). For
+   the 27B this is the ~5 GiB FP16-leftovers gap shown in the
+   [Deployment A footprint table](#deployment-a--qwen36-27b-awq-dense).
+
+Net: AWQ-INT4 typically stays within **<1 perplexity point** and **<1 %** on
+standard benchmarks of the FP16 original — at 4 bits/weight. RTN at the same
+width is far worse.
+
+### The repack: AWQ checkpoint → Marlin (W4A16) for vLLM
+
+The AWQ checkpoint on disk is in AWQ's own layout (group scales/zero-points
+interleaved with the packed weights). vLLM's fast serving path is the **Marlin
+W4A16** kernel — a fused dequant + INT4-GEMM — which needs the weights in a
+different, reordered tiling. So at load vLLM **repacks** AWQ → Marlin: the weight
+tensor is reordered, scales/zero-points reorganized into one packed tensor the
+kernel reads directly, and dequant happens *inside* the GEMM (no separate dequant
+pass). The Dense repack is automatic; the **MoE** repack
+(`awq_marlin_moe_repack`) needs ~128 MiB scratch with raw + Marlin coexisting —
+which is exactly why the MoE run **offloads 2.2 GiB before the repack** (see
+[MoE no-offload math](#moe-no-offload-math-why-offload-is-required-not-optional)).
+
+The payoff: weights stay INT4-packed in GDDR6 through all of serving. For the
+27B that is ~18.8 GiB instead of ~54 GiB FP16 (~2.9× smaller), read at INT4
+bandwidth (~3–4× faster decode). Without AWQ-Marlin neither model fits; with it,
+both decode flat to max context.
+
+### Both models, one recipe
+
+| | Dense 27B | MoE 35B-A3B |
+|---|---|---|
+| AWQ config | 4-bit, group-128, zero-point | 4-bit, group-128, zero-point |
+| quantized to INT4 | every layer's MLP `gate`/`up`/`down` | the 256 routed experts |
+| kept FP16 (`modules_to_not_convert`) | `self_attn` & `linear_attn` projections, `model.layers.0`, `mtp`, `visual` | whole `self_attn` & `linear_attn`, **+ `shared_expert` + router (`mlp.gate`)**, `model.layers.0`, `mtp`, `visual` |
+| repack | automatic | `awq_marlin_moe_repack` — ~128 MiB scratch → forces the 2.2 GiB offload |
+
+Same AWQ-INT4 + Marlin recipe; the only model-specific wrinkle is the MoE
+repack's transient scratch, which is what makes offload mandatory for the 35B
+(the 27B needs none). Both decode flat to their max context — Dense ~21 tps at
+64k, MoE ~15.4 tps at 128k — precisely because AWQ-Marlin keeps their weights
+small enough to leave room for KV.
+
 ## Deployment A — Qwen3.6-27B-AWQ (Dense)
 
 ### Why it fits on 24GB: AWQ + hybrid linear attention + tuned caches
@@ -168,6 +255,8 @@ fast at long context.
 
 `QuantTrio/Qwen3.6-27B-AWQ` is genuinely packed INT4 (not just a name), and vLLM
 runs it on **AWQ-Marlin** (fused dequant + INT4 GEMM) — *not* dequantized to FP16.
+For the quantization method itself (calibration, per-channel scales, the Marlin
+repack) see [AWQ quantization — the method, and why both models use it](#awq-quantization--the-method-and-why-both-models-use-it); this section covers the on-GPU footprint.
 
 | | size | what |
 |---|---|---|
