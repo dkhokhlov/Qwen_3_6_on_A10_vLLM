@@ -146,7 +146,7 @@ it persists into serving, not load-only — but the penalty is ~15 tps, not 2 tp
 | | |
 |---|---|
 | GPU | NVIDIA A10, Ampere sm86, 24GB VRAM (~22.06 GiB usable by vLLM) |
-| PCIe | Gen4 **x4** (card is x16-capable; slot/wiring caps at x4) |
+| PCIe | Gen4 **x4** — eGPU rig: A10 in an external enclosure, host↔GPU routed via an M.2 NVMe → OCuLink (SFF-8612) adapter, which exposes only 4 lanes. Card is x16-capable; the adapter/wiring caps the link at x4. |
 | TP | 1 (single GPU) |
 | 27B weights on GPU | 18.83 GiB |
 | 27B KV + state cache | ~2.15 GiB → 64 744 tokens |
