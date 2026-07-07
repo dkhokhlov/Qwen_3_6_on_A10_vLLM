@@ -82,7 +82,7 @@ TPS, and prefix-cache hit %. Cache hit is read from vLLM `/metrics` (at the
 | **active params / token** | **27B (all)** | **3B (1 shared + routed experts)** |
 | hidden dim | 5120 | 2048 |
 | full-attn layers | 16 | 10 (1-in-4) |
-| attn / KV heads / head_dim | — | 16 / 2 / 256 |
+| attn / KV heads / head_dim | 24 / 4 / 256 | 16 / 2 / 256 |
 | routed experts | none | 256 + 1 shared |
 | weights on GPU (AWQ-Marlin) | 18.83 GiB | ~21.5 GiB (language-only) |
 | KV+state per token | large (16 full-attn × 5120) | small (10 full-attn × 2048) |
@@ -107,12 +107,13 @@ context" intuition:
 |---|---|---|---|
 | active params / token | 27B (every MLP runs) | 3B (only routed experts run) | MoE: lighter compute, but **irrelevant to context** (context is KV-bound, not compute-bound) |
 | full-attn layers | 16 | 10 (1-in-4) | MoE has fewer layers attending over the prefix |
-| hidden dim | 5120 | 2048 | MoE KV head is 4× smaller per layer |
+| hidden dim | 5120 | 2048 | MoE KV head is 2.5× smaller per layer |
 | **KV + state per token** | **~35 KiB** (large; ~3× MoE) | **~11 KiB** (but far fewer full-attn tokens) | MoE pays less context cost per token |
 | weights on GPU | 18.83 GiB (fits) | ~21.5 GiB (does **not** fit) | MoE must offload 2.2 GiB |
 
-The dense 27B is **param-light enough to fit cleanly** (18.83 GiB leaves 3.23
-GiB for KV+state → 64k) but its 16 full-attn layers × hidden 5120 make each
+The dense 27B is **param-light enough to fit cleanly** (18.83 GiB weights +
+~2.15 GiB KV+state ≈ 21.0 GiB, under the 21.40 GiB 0.97-budget → 64k) but its
+16 full-attn layers × hidden 5120 make each
 context token expensive, so 64k is the no-offload ceiling.
 
 The MoE 35B is **param-heavy on weights** (21.5 GiB > free GPU) but its 10
@@ -131,11 +132,11 @@ Budget at util 0.97 = 0.97 × 22.06 = 21.40 GiB. Post-repack weights ≈ 21.38 G
 From the 1 GiB offload run: GPU weights 20.31, KV 0.65 → vLLM's non-KV reserve
 = (21.40 − 20.31) − 0.65 ≈ 0.44 GiB (mamba state + activation scratch + safety).
 
-| path | weights | reserve | total | vs 21.40 GiB budget | usable context |
+| path | weights | reserve | total | budget headroom (per-row util) | usable context |
 |---|---|---|---|---|---|
-| GPU-only @ 0.97 | 21.38 | 0.44 | 21.82 | over by 0.42 (Marlin repack OOM) | ~0 |
-| GPU-only @ 0.99 | 21.38 | 0.44 | 21.82 | over by ~0.02 (but 0.99 fails init) | ~2k |
-| **2.2 GiB offload @ 0.95** | 19.18 | 0.44 | 19.62 | 1.78 GiB for KV+state | **128k** |
+| GPU-only @ 0.97 | 21.38 | 0.44 | 21.82 | over by 0.42 (vs 21.40; Marlin repack OOM) | ~0 |
+| GPU-only @ 0.99 | 21.38 | 0.44 | 21.82 | under by ~0.02 (vs 21.84; fails init) | ~2k |
+| **2.2 GiB offload @ 0.95** | 19.18 | — | 19.18 | 1.78 GiB KV+state (measured, 150 349 tok; 20.96 − 19.18) | **128k** |
 
 So GPU-only is param+reserve-bound by ~0.2 GiB at the achievable util; offload
 is required for any usable context. (The offload is a *serving-time* offload —
@@ -150,7 +151,7 @@ it persists into serving, not load-only — but the penalty is ~15 tps, not 2 tp
 | TP | 1 (single GPU) |
 | 27B weights on GPU | 18.83 GiB |
 | 27B KV + state cache | ~2.15 GiB → 64 744 tokens |
-| 35B MoE weights on GPU | ~19.2 GiB (after 2.2 GiB offload of 21.5 GiB) |
+| 35B MoE weights on GPU | ~19.2 GiB (after 2.2 GiB offload from ~21.4 GiB post-repack) |
 | 35B MoE KV + state cache | ~1.78 GiB → 150 349 tokens |
 
 A second A10 on the same host would lift both ceilings and remove the MoE
@@ -182,7 +183,7 @@ unquantized for accuracy (config `modules_to_not_convert`):
 | `self_attn.{q,k,v}_proj`, `linear_attn.in_proj_{a,b}`, `model.layers.0`, `mtp` | MLP `gate` / `up` / `down` (the big tensors) |
 
 If vLLM dequantized to FP16 the footprint would be ~54 GiB — wouldn't fit, and
-decode would be ~3× slower. Marlin keeps INT4 packed in GDDR6 and dequants inside
+decode would be ~3–4× slower. Marlin keeps INT4 packed in GDDR6 and dequants inside
 the GEMM, so you get the full memory/bandwidth benefit.
 
 #### 2. Hybrid architecture — 48 of 64 layers are linear (GatedDeltaNet)
@@ -334,7 +335,7 @@ Qwen3.6-35B-A3B-AWQ  —  40 transformer layers (hybrid)
 ```
 
 The MoE keeps the same hybrid linear/full-attn split as the dense 27B but with
-**fewer layers (40 vs 64), fewer full-attn layers (10 vs 16), and a 4× smaller
+**fewer layers (40 vs 64), fewer full-attn layers (10 vs 16), and a 2.5× smaller
 hidden (2048 vs 5120)** — that is the source of its larger context ceiling.
 
 ### Why offload is required (measured envelope)
@@ -514,7 +515,7 @@ bound and P2P is ~half of it.
 
 TP=2 all-reduce volume (model geometry: hidden=5120, layers=64, fp16). Per-layer
 tensor = 10 KiB at decode batch=1; one-way = 64 × 10 KiB = 640 KiB/token (decode),
-1.31 GB for a 2000-token prefill.
+1.22 GiB for a 2000-token prefill.
 
 | | SHM fallback (worst) | P2P (≈half) |
 |---|---|---|
@@ -558,7 +559,7 @@ the MoE offload tax. The PCIe grounding above shows **TP=2 pays off for decode**
            └───────────── all-reduce ────────────┘
                  per layer, over x4:
                    decode   ~640 KiB/token  → <0.5% of step
-                   prefill  ~1.31 GB / 2000 → ~10–20% of step
+                   prefill  ~1.22 GiB / 2000 → ~10–20% of step
                  transport: P2P (1 hop) if ACS allows, else SHM (2 hops)
 ```
 
@@ -654,8 +655,8 @@ The 2×A10 MoE projection's reasoning:
 - `NCCL_DEBUG=INFO` log: `via P2P/IPC` (best) or `via SHM` (fallback, fine);
   `via NET` would indicate TCP (shouldn't happen intra-node).
 - 27B decode ~40–42 tps, 35B MoE decode > 15.4 (no offload stall) → TP working;
-  ~21/15.4 → not sharding the hybrid layers; init error → TP unsupported for the
-  hybrid arch.
+  27B stuck at ~21 tps and MoE at 15.4 tps (both single-GPU rates, no TP speedup)
+  → not sharding the hybrid layers; init error → TP unsupported for the hybrid arch.
 
 ### Open risks (not resolvable on a 1-GPU box)
 
@@ -683,7 +684,7 @@ Loading drafter model...          # OOM: tried to allocate 340.00 MiB, 224 MiB f
 ```
 
 Root cause: at drafter load the GPU holds weights (18.83 GiB) + fixed overhead
-(~3 GiB = FP16 embedding ~1.56 + CUDA ctx ~0.6 + cuDNN workspaces ~0.5) ≈ 21.8
+(~3 GiB = FP16 embedding ~1.56 + CUDA ctx ~0.6 + cuDNN workspaces ~0.5 + activation/scratch ~0.35) ≈ 21.84
 GiB, leaving only ~184–224 MiB. The MTP head needs ~340 MiB. The shortfall is
 **independent of `num_speculative_tokens`** (1 vs 2 changes only runtime draft
 activations, not the head footprint) and **independent of util** (drafter loads
@@ -728,14 +729,14 @@ param-bound). Do not retry without reason.
 ## Hardware ceiling facts
 
 - **120k no-offload is impossible on this A10 for the dense 27B**: 22.06 −
-  18.83 = 3.23 GiB free; at the measured ~35 KiB/token, 120k needs ~4.0 GiB —
-  over budget. Hard upper bound ~72–80k tokens (FP16 state; the bare per-token
-  rate allows ~95k, but non-KV overhead lowers the real ceiling).
+  18.83 = 3.23 GiB raw free (0.97 cap → 2.57); at ~35 KiB/token, 120k needs
+  ~4.0 GiB — over budget. Real ceiling 64 744 tokens (L152; the bare rate on
+  raw free is ~95k, but the 0.97 cap + non-KV overhead lower it to 64k).
 - **The MoE 35B is param-bound without offload** — weights 21.38 + reserve 0.44
   = 21.82 GiB > the 21.40 GiB achievable at util 0.97. No amount of context fits
   without `--cpu-offload-gb`; 2.2 GiB offload lifts it to 128k.
-- **`--gpu-memory-utilization` > 0.98 fails** on this A10: free VRAM
-  21.83/22.06 GiB < 0.99×22.06.
+- **`--gpu-memory-utilization` above ~0.99 fails** on this A10: free VRAM
+  21.83/22.06 = 0.9896, so 0.99×22.06 = 21.84 > 21.83.
 - **FP8 KV on Ampere** works via FlashInfer (auto-selected); no native FP8 tensor
   cores needed. `int4_per_token_head` KV is nightly-only; TurboQuant 4-bit KV is
   broken on hybrid Qwen3.5.
