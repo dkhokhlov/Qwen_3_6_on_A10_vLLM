@@ -13,7 +13,7 @@ Configs and measurements for both Qwen3.6 checkpoints on a single
 **The bigger MoE serves *more* context than the smaller dense model** — 128k vs
 64k — because MoE has far fewer active params per token and a smaller KV per
 token. The MoE's 35B weights don't fit without offload; the dense 27B fits
-cleanly. See [DENSE vs MoE — why the bigger model serves more context](#dense-vs-moe--why-the-bigger-model-serves-more-context).
+cleanly. See [Dense vs MoE — why the bigger model serves more context](#dense-vs-moe--why-the-bigger-model-serves-more-context).
 
 - vLLM OpenAI API: `http://localhost:8000/v1`
   - 27B served-model-name: `qwen3.6-27b`
@@ -25,13 +25,13 @@ cleanly. See [DENSE vs MoE — why the bigger model serves more context](#dense-
 - [Quick Start](#quick-start)
 - [Repo structure](#repo-structure)
 - [TL;DR — one A10, both models](#tldr--one-a10-both-models)
-- [DENSE vs MoE — why the bigger model serves more context](#dense-vs-moe--why-the-bigger-model-serves-more-context)
+- [Dense vs MoE — why the bigger model serves more context](#dense-vs-moe--why-the-bigger-model-serves-more-context)
 - [Hardware](#hardware)
 - [Deployment A — Qwen3.6-27B-AWQ (Dense)](#deployment-a--qwen36-27b-awq-dense)
 - [Deployment B — Qwen3.6-35B-A3B-AWQ (MoE)](#deployment-b--qwen36-35b-a3b-awq-moe)
 - [Prefix caching](#prefix-caching)
 - [PCIe bandwidth — grounding the TP=2-on-x4 question](#pcie-bandwidth--grounding-the-tp2-on-x4-question)
-- [Two A10 cards — TP=2 projections for DENSE and MoE](#two-a10-cards--tp2-projections-for-dense-and-moe)
+- [Two A10 cards — TP=2 projections for Dense and MoE](#two-a10-cards--tp2-projections-for-dense-and-moe)
 - [Experiments that did NOT work (do not retry without reason)](#experiments-that-did-not-work-do-not-retry-without-reason)
 - [Hardware ceiling facts](#hardware-ceiling-facts)
 - [Gotchas](#gotchas)
@@ -41,9 +41,9 @@ cleanly. See [DENSE vs MoE — why the bigger model serves more context](#dense-
 | target | what |
 |---|---|
 | `make` | help (default) |
-| `make run` | `docker compose up` — 27B DENSE, foreground (Ctrl-C to stop) |
-| `make start` | `docker compose up -d` — 27B DENSE, detached |
-| `make stop` | `docker compose stop` — 27B DENSE |
+| `make run` | `docker compose up` — 27B Dense, foreground (Ctrl-C to stop) |
+| `make start` | `docker compose up -d` — 27B Dense, detached |
+| `make stop` | `docker compose stop` — 27B Dense |
 | `make run35` | `docker compose -f docker-compose.moe.yaml up` — 35B MoE, foreground |
 | `make start35` | `docker compose -f docker-compose.moe.yaml up -d` — 35B MoE, detached |
 | `make stop35` | `docker compose -f docker-compose.moe.yaml stop` — 35B MoE |
@@ -51,7 +51,7 @@ cleanly. See [DENSE vs MoE — why the bigger model serves more context](#dense-
 | `make bench35` | same bench on the 35B MoE (override `TURNS=N`; `TURNS=54` → ~128k) |
 | `make bench_pcie` | GPU↔host PCIe bandwidth (needs a free GPU: `make stop` first) |
 
-`run`/`start`/`stop` target the 27B DENSE stack (`docker-compose.yaml`);
+`run`/`start`/`stop` target the 27B Dense stack (`docker-compose.yaml`);
 `run35`/`start35`/`stop35` target the 35B MoE stack (`docker-compose.moe.yaml`).
 The two stacks use the same port (8000) and container name prefix, so stop one
 before starting the other.
@@ -66,7 +66,7 @@ TPS, and prefix-cache hit %. Cache hit is read from vLLM `/metrics` (at the
 
 | file | what |
 |---|---|
-| `docker-compose.yaml` | vLLM (27B DENSE) + open-webui stack |
+| `docker-compose.yaml` | vLLM (27B Dense) + open-webui stack |
 | `docker-compose.moe.yaml` | vLLM (35B MoE, 128k, 2.2 GiB offload) stack |
 | `Makefile` | `run` / `start` / `stop` / `run35` / `start35` / `stop35` / `bench` / `bench35` / `bench_pcie` |
 | `scripts/coding_session_bench.py` | growing coding-session bench (prefill/output tps, cache hit from `/metrics`) |
@@ -75,7 +75,7 @@ TPS, and prefix-cache hit %. Cache hit is read from vLLM `/metrics` (at the
 
 ## TL;DR — one A10, both models
 
-| | Qwen3.6-27B-AWQ (**DENSE**) | Qwen3.6-35B-A3B-AWQ (**MoE**) |
+| | Qwen3.6-27B-AWQ (**Dense**) | Qwen3.6-35B-A3B-AWQ (**MoE**) |
 |---|---|---|
 | architecture | hybrid: 48 GDN linear + 16 full-attn / 64 layers | hybrid: 30 GDN linear + 10 full-attn / 40 layers |
 | total params | 27B | 35B |
@@ -97,13 +97,13 @@ TPS, and prefix-cache hit %. Cache hit is read from vLLM `/metrics` (at the
 | compose file | `docker-compose.yaml` | `docker-compose.moe.yaml` |
 | bench target | `make bench` | `make bench35` |
 
-## DENSE vs MoE — why the bigger model serves more context
+## Dense vs MoE — why the bigger model serves more context
 
 **The 35B model serves 128k context while the 27B only serves 64k — despite
 the 35B having more weights.** Three facts invert the "bigger model = less
 context" intuition:
 
-| lever | DENSE 27B | MoE 35B-A3B | effect on context ceiling |
+| lever | Dense 27B | MoE 35B-A3B | effect on context ceiling |
 |---|---|---|---|
 | active params / token | 27B (every MLP runs) | 3B (only routed experts run) | MoE: lighter compute, but **irrelevant to context** (context is KV-bound, not compute-bound) |
 | full-attn layers | 16 | 10 (1-in-4) | MoE has fewer layers attending over the prefix |
@@ -182,7 +182,7 @@ unquantized for accuracy (config `modules_to_not_convert`):
 | `self_attn.{q,k,v}_proj`, `linear_attn.in_proj_{a,b}`, `model.layers.0`, `mtp` | MLP `gate` / `up` / `down` (the big tensors) |
 
 If vLLM dequantized to FP16 the footprint would be ~54 GiB — wouldn't fit, and
-decode would be ~3× slower. Marlin keeps INT4 packed in HBM and dequants inside
+decode would be ~3× slower. Marlin keeps INT4 packed in GDDR6 and dequants inside
 the GEMM, so you get the full memory/bandwidth benefit.
 
 #### 2. Hybrid architecture — 48 of 64 layers are linear (GatedDeltaNet)
@@ -228,7 +228,7 @@ layers attend over the entire cached prefix per prefilled token. See
 
 | cache | dtype | covers | why |
 |---|---|---|---|
-| KV cache | **fp8** | 16 full-attn layers | FlashInfer on Ampere; halves KV HBM |
+| KV cache | **fp8** | 16 full-attn layers | FlashInfer on Ampere; halves KV in GDDR6 |
 | mamba state cache | **float16** | 48 linear-attn layers | **key lever** — config defaults FP32; FP16 lifts the no-offload ceiling 54.9k → 72.5k tokens |
 | prefix cache | on (align mode) | cross-request reuse | experimental for hybrid; 800-token block size |
 
@@ -292,7 +292,7 @@ turn  prompt   out     seq  cached uncached  ttft_s prefill_tps  out_tps  lat_s 
   27   63424   500   63924   60800     2624    4.99       525.8     19.6   30.5   96
 ```
 
-- **Output TPS ~21 → 19.6** — HBM-bandwidth-bound (~600 GB/s, 18.83 GiB weights).
+- **Output TPS ~21 → 19.6** — GDDR6-bandwidth-bound (~600 GB/s, 18.83 GiB weights).
   Stays nearly flat to 64k because 48/64 layers are linear (`O(1)`/token).
 - **Prefill TPS 1026 → 526** (uncached new turn) — the 16 full-attn layers
   attend over the growing prefix per prefilled token (`O(context × uncached)`).
@@ -438,12 +438,12 @@ The 2.2 GiB UVA offload is not free at serving time:
   choice, not a bug; it is present at 0 offload.
 - **GPU power caps at ~80 %** (120 W / 150 W) — the GPU is starved ~20 % of the
   step by PCIe stalls reading the offloaded weight fraction + `--enforce-eager`
-  kernel-launch bubbles + batch=1 (no overlap). Treat 80 % as the efficiency
+  kernel-launch bubbles + batch=1 (no overlap). 80 % is the efficiency
   ceiling of the offload path: decode would be higher on a GPU-only deployment
   (see [Two A10 cards](#two-a10-cards--tp2-projections-for-dense-and-moe)).
 - **vLLM-log "2.4 t/s" and "0 % hit" are misleading at idle** — the Avg
   generation throughput is a rolling average diluted by idle gaps, and a single
-  idle sample shows 0 % hit. Watch the per-turn bench numbers, not the idle log.
+  idle sample shows 0 % hit. The per-turn bench numbers are authoritative, not the idle log.
 
 ### MoE checkpoint status
 
@@ -470,7 +470,7 @@ block size set by the mamba page alignment:
 
 | model | align block size |
 |---|---|
-| 27B DENSE | **800 tokens** |
+| 27B Dense | **800 tokens** |
 | 35B MoE | **1072 tokens** |
 
 - **Long prompts hit well**: 98.8 % hit on a 2430-token prompt (27B, 3×
@@ -494,7 +494,7 @@ past N requests** — it is a lagging moving average, not the current request's
 hit rate. During the 35B bench the *reported* rate reads ~36 % while the
 per-turn hit (from `/metrics` deltas) is already ~90 %+. By the end of the run
 the reported rate converges to ~98 %. A low reported `hit_rate` mid-run is not a
-bug — read the per-turn bench column, or wait for the rolling window to fill.
+bug — the per-turn bench column is authoritative, or wait for the rolling window to fill.
 
 ## PCIe bandwidth — grounding the TP=2-on-x4 question
 
@@ -514,25 +514,25 @@ bound and P2P is ~half of it.
 
 TP=2 all-reduce volume (model geometry: hidden=5120, layers=64, fp16). Per-layer
 tensor = 10 KiB at decode batch=1; one-way = 64 × 10 KiB = 640 KiB/token (decode),
-1.31 GB for a 2k-token prefill.
+1.31 GB for a 2000-token prefill.
 
 | | SHM fallback (worst) | P2P (≈half) |
 |---|---|---|
 | decode (47 ms step) | **0.43 %** (203 µs) | ~0.2 % |
-| prefill 2k (2.0 s) | **19.8 %** (396 ms) | ~10 % |
+| prefill 2000 (2.0 s) | **19.8 %** (396 ms) | ~10 % |
 
 **Conclusion:** on x4, TP=2 all-reduce is negligible for decode (<0.5 %) — the
->20-tps goal is unhurt by comm; HBM-read parallelism (each GPU reads half the
+>20-tps goal is unhurt by comm; GDDR6-read parallelism (each GPU reads half the
 weights) is what gives ~2× decode. Prefill pays a real ~10–20 % comm tax on x4
 (1026 → ~850–870 prefill tps). The decisive unknown this 1-GPU test can't
-resolve is whether NCCL selects P2P or SHM on the 2-GPU board — confirm with
-`NCCL_DEBUG=INFO`.
+resolve is whether NCCL selects P2P or SHM on the 2-GPU board; identifiable only from the
+`NCCL_DEBUG=INFO` log.
 
 > Caveat: PCIe ASPM downshifts the link to Gen1 at idle; `nvidia-smi` at rest
 > reports Gen1. The bench warms the link first so the reported gen matches the
 > achieved bandwidth (Gen4).
 
-## Two A10 cards — TP=2 projections for DENSE and MoE
+## Two A10 cards — TP=2 projections for Dense and MoE
 
 Two A10s on a single host (no NVLink — x4 only): lifts context ceilings and removes
 the MoE offload tax. The PCIe grounding above shows **TP=2 pays off for decode**
@@ -548,7 +548,7 @@ the MoE offload tax. The PCIe grounding above shows **TP=2 pays off for decode**
            │ ~6.6 GB/s each way                  │
   ┌────────▼───────────────────────┐    ┌────────▼───────────────────────┐
   │          A10 #0                │    │           A10 #1               │
-  │  24GB HBM @ ~600 GB/s          │    │  24GB HBM @ ~600 GB/s          │
+  │  24GB GDDR6 @ ~600 GB/s        │    │  24GB GDDR6 @ ~600 GB/s        │
   │                                │    │                                │
   │  TP=2 shard per layer:         │    │  TP=2 shard per layer:         │
   │   • half the weights           │    │   • half the weights           │
@@ -558,7 +558,7 @@ the MoE offload tax. The PCIe grounding above shows **TP=2 pays off for decode**
            └───────────── all-reduce ────────────┘
                  per layer, over x4:
                    decode   ~640 KiB/token  → <0.5% of step
-                   prefill  ~1.31 GB / 2k   → ~10–20% of step
+                   prefill  ~1.31 GB / 2000 → ~10–20% of step
                  transport: P2P (1 hop) if ACS allows, else SHM (2 hops)
 ```
 
@@ -582,7 +582,7 @@ needs a ≥40 GB GPU.
 
 ### Why TP=2, not PP=2, for single-user serving on x4
 
-- **TP=2 parallelizes the HBM weight reads** (the actual decode bottleneck) —
+- **TP=2 parallelizes the GDDR6 weight reads** (the actual decode bottleneck) —
   each GPU reads half the weights per step → ~2× decode tps. All-reduce at
   batch=1 is ~1.3 MB/token, negligible on x4.
 - **PP=2 at batch=1 does not overlap** (no pipeline to fill) — stages run
@@ -593,29 +593,44 @@ needs a ≥40 GB GPU.
 
 ### Projected decode tps
 
-HBM-bound: `tps ≈ BW / weights_read_per_token × ~0.7`. 1×A10 rows are measured;
-2×A10 rows are projections (cannot test on this 1-GPU box).
+Dense decode is GDDR6-bound: `tps ≈ BW / weights_read_per_token × ~0.7`. The formula
+is decode-only — the MoE 2× decode is a heuristic (see the bullet below) and 2×
+prefill is **not modeled**. 1×A10 rows are measured; 2×A10 rows are untested
+projections (no second GPU available for measurement).
 
 | model | setup | offload | decode tps | prefill tps | context | fits 2×A10? |
 |---|---|---|---|---|---|---|
-| 27B DENSE | 1× A10 | none | ~21 | ~1026 | 64k | n/a (measured) |
-| 27B DENSE | 2× A10 TP=2 | none | ~35–40 | ~1600–1700 | 64k+ | yes (overkill) |
+| 27B Dense | 1× A10 | none | ~21 | ~1026 | 64k | n/a (measured) |
+| 27B Dense | 2× A10 TP=2 | none | ~40–42 | not modeled | 64k+ | yes (overkill) |
 | 35B MoE | 1× A10 | **2.2 GiB** | ~15.4 | ~966→698 | 128k | n/a (measured) |
-| 35B MoE | 2× A10 **TP=2** | **none** | **~20–24 (proj)** | ~1100 (proj) | **256k (proj)** | **yes (proj)** |
+| 35B MoE | 2× A10 **TP=2** | **none** | **~20–24 (proj)** | not modeled | **256k (proj)** | **yes (proj)** |
 
 The 2×A10 MoE projection's reasoning:
 
 - **No offload needed** — ~21.5 GiB / 2 ≈ 11 GiB/GPU weights, ample room for
   KV+state. Removing offload removes the PCIe-stall tax (the 80 %-power ceiling)
   and the 100 %-CPU offloader thread.
-- **Decode rises above 15.4** — bounded only by per-token expert-read HBM. The
-  MoE activates ~3B params/token (1 shared + ~8 routed experts), so each GPU
-  reads ~1.5 GiB/token → far less than the dense 27B's 9.4 GiB/GPU read. The
-  range ~20–24 tps assumes no routing overhead and the same ~0.7 HBM efficiency
-  factor; verify on real hardware.
-- **Context to 256k** — half-KV headroom (11 GiB/GPU weights leaves ~10 GiB
-  for KV+state per GPU) and the MoE's small KV/token make 256k plausible; the
-  1072-token mamba align block still requires `--max-num-batched-tokens ≥ 1072`.
+- **Decode rises from 15.4 to ~20–24 tps — a heuristic, not a formula output.**
+  The dense `BW / weights_read × 0.7` model does **not** transfer to a sparse
+  MoE: plugging the active read (~3B params = **~1.4 GiB/token total**, ~0.7
+  GiB/GPU under TP=2) into it gives an absurd ~260 tps. The active read is too
+  small to be memory-bandwidth-bound at batch=1 — 1× MoE reads only ~1.5
+  GiB/token yet manages 15.4 tps (implies ~23 GiB/s, ~4 % of the A10's ~600
+  GB/s GDDR6), so decode is **stall-/overhead-bound** (UVA PCIe stalls +
+  `--enforce-eager` kernel-launch bubbles + MoE routing). The lift has two
+  sources: **(1)** removing the offload kills the ~20 % PCIe-power stall (the
+  80 %-power ceiling) — the dominant effect, moving the floor toward ~19–20
+  tps; **(2)** TP=2 halves the always-active backbone read (q/k/v, linear-attn
+  in_proj, shared expert, embed, lm_head — read every token regardless of
+  routing), a modest extra lift toward ~24. This is far short of the dense
+  model's ~2× precisely because the step is stall/overhead-bound, not
+  memory-bandwidth-bound; subject to verification on real hardware.
+- **Context to 256k (conservative — VRAM is not the limiter)** — ~10 GiB/GPU
+  for KV+state is far more than 256k needs: scaling the measured 1× ratio
+  (1.78 GiB → 150 349 tokens) by the halved per-GPU KV gives ~1.7 M tokens of
+  capacity per GPU. 256k is therefore bounded by the model's `--max-model-len` /
+  max-context config, not by VRAM; the 1072-token mamba align block still
+  requires `--max-num-batched-tokens ≥ 1072`.
 
 ### Config diff (single-GPU → 2-GPU TP=2)
 
@@ -636,8 +651,8 @@ The 2×A10 MoE projection's reasoning:
 
 - `nvidia-smi` per-GPU memory **balanced** (~equal) → TP shards both layer types.
 - `NCCL_DEBUG=INFO` log: `via P2P/IPC` (best) or `via SHM` (fallback, fine);
-  avoid `via NET` (would mean TCP, shouldn't happen intra-node).
-- 27B decode ~35–40 tps, 35B MoE decode > 15.4 (no offload stall) → TP working;
+  `via NET` would indicate TCP (shouldn't happen intra-node).
+- 27B decode ~40–42 tps, 35B MoE decode > 15.4 (no offload stall) → TP working;
   ~21/15.4 → not sharding the hybrid layers; init error → TP unsupported for the
   hybrid arch.
 
@@ -740,4 +755,4 @@ param-bound). Do not retry without reason.
   mounted HF cache is read-only and offline (`HF_HUB_OFFLINE=1`).
 - **Idle vLLM log lines are misleading**: `Avg generation throughput: 2.4 t/s`
   and `Prefix cache hit rate: 0.0%` at idle are a rolling-average artifact and
-  an empty-window sample — not the serving rate. Read the per-turn bench column.
+  an empty-window sample — not the serving rate. The per-turn bench column is authoritative.
