@@ -647,8 +647,9 @@ the MoE offload tax. The PCIe grounding above shows **TP=2 pays off for decode**
            │                                     │
            └───────────── all-reduce ────────────┘
                  per layer, over x4:
-                   decode   ~640 KiB/token  → <0.5% of step
-                   prefill  ~1.22 GiB / 2000 → ~10–20% of step
+                   27B decode   ~640 KiB/token  → <0.5% of 47 ms step
+                   35B decode   ~320 KiB/token  → <1–2% of 6.7 ms step
+                   27B prefill  ~1.22 GiB / 2000 → ~10–20% of step
                  transport: P2P (1 hop) if ACS allows, else SHM (2 hops)
 ```
 
@@ -673,8 +674,9 @@ needs a ≥40 GB GPU.
 ### Why TP=2, not PP=2, for single-user serving on x4
 
 - **TP=2 parallelizes the GDDR6 weight reads** (the actual decode bottleneck) —
-  each GPU reads half the weights per step → ~2× decode tps. All-reduce at
-  batch=1 is ~1.3 MB/token, negligible on x4.
+  each GPU reads half the weights per step → faster decode. All-reduce at
+  batch=1 is small on x4: ~640 KiB/token one-way for the 27B Dense and
+  ~320 KiB/token for the 35B MoE nominal two-collective/layer path used below.
 - **PP=2 at batch=1 does not overlap** (no pipeline to fill) — stages run
   serially, one GPU idle each half-step → ~same latency as a single GPU that
   could fit the model, *plus* comm. PP makes a too-big model **fit** but does
@@ -684,38 +686,46 @@ needs a ≥40 GB GPU.
 ### Projected decode tps
 
 Dense decode is GDDR6-bound: `tps ≈ BW / weights_read_per_token × ~0.7`. The formula
-is decode-only — the MoE 2× decode is a heuristic (see the bullet below) and 2×
-prefill is **not modeled**. 1×A10 rows are measured; 2×A10 rows are untested
-projections (no second GPU available for measurement).
+is decode-only; MoE uses a separate active-read envelope because the single-GPU
+MoE measurement is contaminated by UVA offload stalls. 1×A10 rows are measured;
+2×A10 rows are untested projections (no second GPU available for measurement).
 
 | model | setup | offload | decode tps | prefill tps | context | fits 2×A10? |
 |---|---|---|---|---|---|---|
 | 27B Dense | 1× A10 | none | ~21 | ~1026 | 64k | n/a (measured) |
 | 27B Dense | 2× A10 TP=2 | none | ~40–42 | not modeled | 64k+ | yes (overkill) |
 | 35B MoE | 1× A10 | **2.2 GiB** | ~15.4 | ~966→698 | 128k | n/a (measured) |
-| 35B MoE | 2× A10 **TP=2** | **none** | **~20–24 (proj)** | not modeled | **256k (proj)** | **yes (proj)** |
+| 35B MoE | 2× A10 **TP=2** | **none** | **~120–180 short/mod ctx; ~80–150 at 256k (proj)** | not modeled | **256k (proj)** | **yes (proj)** |
 
 The 2×A10 MoE projection's reasoning:
 
 - **No offload needed** — ~21.5 GiB / 2 ≈ 11 GiB/GPU weights, ample room for
   KV+state. Removing offload removes the PCIe-stall tax (the 80 %-power ceiling)
   and the 100 %-CPU offloader thread.
-- **Decode rises from 15.4 to ~20–24 tps — a heuristic, not a formula output.**
-  The dense `BW / weights_read × 0.7` model does **not** transfer to a sparse
-  MoE: plugging the active read into it gives an absurd result either way —
-  ~260–280 tps at the 1× total (~1.4–1.5 GiB/token), ~560 tps at the TP=2
-  per-GPU read (~0.7 GiB). The active read is too
-  small to be memory-bandwidth-bound at batch=1 — 1× MoE reads only ~1.5
-  GiB/token yet manages 15.4 tps (implies ~23 GiB/s, ~4 % of the A10's ~600
-  GB/s GDDR6), so decode is **stall-/overhead-bound** (UVA PCIe stalls +
-  `--enforce-eager` kernel-launch bubbles + MoE routing). The lift has two
-  sources: **(1)** removing the offload kills the ~20 % PCIe-power stall (the
-  80 %-power ceiling) — the dominant effect, moving the floor toward ~19–20
-  tps; **(2)** TP=2 halves the always-active backbone read (q/k/v, linear-attn
-  in_proj, shared expert, embed, lm_head — read every token regardless of
-  routing), a modest extra lift toward ~24. This is far short of the dense
-  model's ~2× precisely because the step is stall/overhead-bound, not
-  memory-bandwidth-bound; subject to verification on real hardware.
+- **Decode planning estimate is context-sensitive: ~120–180 tps at short/moderate
+  context, degrading toward ~80–150 tps at 256k.** Do not anchor the no-offload
+  TP=2 case to the measured 15.4 tps single-A10 row: that row is the 2.2 GiB UVA
+  offload path, so it includes PCIe weight-read stalls and the 100 %-CPU offloader
+  thread. A no-offload TP=2 deployment moves the active weights back into GDDR6
+  and shards the language weights across both cards.
+- **GDDR6 bandwidth does not rule out ~150 tps, but the raw ceiling falls with
+  context.** A10 GDDR6 is ~600 GB/s (~559 GiB/s). The MoE active weight read is
+  roughly ~1.4–1.5 GiB/token total, or ~0.7–0.75 GiB/token per GPU under TP=2,
+  so the weights-only near-zero-context ceiling is ~745–800 tps before
+  kernel/runtime overhead. At long context the 10 full-attention layers add KV
+  reads: roughly ~0.6 GiB/GPU at 128k and ~1.3 GiB/GPU at 256k, lowering the
+  GDDR6 ceiling to about ~400 tps at 128k and ~275 tps at 256k before fixed
+  GatedDeltaNet state reads and runtime overhead. A ~150 tps target is therefore
+  light at short context (~20 % of the weights-only ceiling) but material at
+  256k (~55 % of the KV-inclusive ceiling).
+- **PCIe x4 all-reduce is a tax, but not a 20-tps limiter for decode.** The MoE
+  hidden size is 2048 with 40 layers, so a two-collective/layer decode path is
+  ~320 KiB/token. That is ~50 µs over P2P and ~100 µs through SHM fallback at
+  the measured ~6.6 GB/s x4 bandwidth. At ~150 tps (6.7 ms/token),
+  bandwidth-only comm is <1–2 %. Collective launch latency may be larger than
+  the transfer time, especially with `--enforce-eager`, which is why the
+  projection is far below the raw GDDR6 ceiling; it still should not collapse to
+  the offloaded 15.4 tps regime if TP is actually active.
 - **Context to 256k (conservative — VRAM is not the limiter)** — ~10 GiB/GPU
   for KV+state is far more than 256k needs: scaling the measured 1× ratio
   (1.78 GiB → 150 349 tokens) by the halved per-GPU KV gives ~1.7 M tokens of
@@ -743,9 +753,10 @@ The 2×A10 MoE projection's reasoning:
 - `nvidia-smi` per-GPU memory **balanced** (~equal) → TP shards both layer types.
 - `NCCL_DEBUG=INFO` log: `via P2P/IPC` (best) or `via SHM` (fallback, fine);
   `via NET` would indicate TCP (shouldn't happen intra-node).
-- 27B decode ~40–42 tps, 35B MoE decode > 15.4 (no offload stall) → TP working;
-  27B stuck at ~21 tps and MoE at 15.4 tps (both single-GPU rates, no TP speedup)
-  → not sharding the hybrid layers; init error → TP unsupported for the hybrid arch.
+- 27B decode ~40–42 tps; 35B MoE decode ~120+ tps at short/moderate context, or
+  materially above 15.4 tps at 256k → no-offload TP is working. MoE stuck near
+  15.4 tps means the run is still effectively on the offloaded/single-GPU path,
+  TP is not sharding the hybrid layers, or init fell back/failed.
 
 ### Open risks (not resolvable on a 1-GPU box)
 
