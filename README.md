@@ -697,8 +697,8 @@ MoE measurement is contaminated by UVA offload stalls. 1×A10 rows are measured;
 | model | setup | offload | decode tps | prefill tps | context | fits 2×A10? |
 |---|---|---|---|---|---|---|
 | 27B Dense | 1× A10 | none | ~21 | ~1026 | 64k | n/a (measured) |
-| 27B Dense | 2× A10 TP=2 | none | **~35 @128k (proj)** | not modeled | **128k (proj; VRAM ceiling ~640k tok)** | yes |
 | 35B MoE | 1× A10 | **2.2 GiB** | ~15.4 | ~966→698 | 128k | n/a (measured) |
+| 27B Dense | 2× A10 TP=2 | none | **~35 @128k (proj)** | not modeled | **128k (proj; VRAM ceiling ~640k tok)** | yes |
 | 35B MoE | 2× A10 **TP=2** | **none** | **~120–180 short/mod ctx; ~80–150 at 256k (proj)** | not modeled | **256k (proj)** | **yes (proj)** |
 
 The 2×A10 projections' reasoning:
