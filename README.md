@@ -628,6 +628,10 @@ Two A10s on a single host (no NVLink — x4 only): lifts context ceilings and re
 the MoE offload tax. The PCIe grounding above shows **TP=2 pays off for decode**
 (all-reduce <0.5 % of the step); prefill pays ~10–20 %.
 
+> Validation status: the second A10 hardware is on the way in. The TP=2 setup is
+> planned to be validated on real hardware in the next few weeks; until then,
+> all 2×A10 rows below are projections, not measured results.
+
 ```
                        single host — A10s have NO NVLink
   ┌──────────────────────────────────────────────────────────────────────┐
@@ -693,11 +697,24 @@ MoE measurement is contaminated by UVA offload stalls. 1×A10 rows are measured;
 | model | setup | offload | decode tps | prefill tps | context | fits 2×A10? |
 |---|---|---|---|---|---|---|
 | 27B Dense | 1× A10 | none | ~21 | ~1026 | 64k | n/a (measured) |
-| 27B Dense | 2× A10 TP=2 | none | ~40–42 | not modeled | 64k+ | yes (overkill) |
+| 27B Dense | 2× A10 TP=2 | none | **~35 @128k (proj)** | not modeled | **128k (proj; VRAM ceiling ~640k tok)** | yes |
 | 35B MoE | 1× A10 | **2.2 GiB** | ~15.4 | ~966→698 | 128k | n/a (measured) |
 | 35B MoE | 2× A10 **TP=2** | **none** | **~120–180 short/mod ctx; ~80–150 at 256k (proj)** | not modeled | **256k (proj)** | **yes (proj)** |
 
-The 2×A10 MoE projection's reasoning:
+The 2×A10 projections' reasoning:
+
+- **Dense 27B TP=2 fits 128k with large margin.** Weights shard to ~9.4 GiB/GPU;
+  KV+state is ~35 KiB/token, halved to ~17 KiB/GPU under TP=2, so 128k costs
+  ~2.2 GiB/GPU. With a conservative runtime reserve, that leaves ~8–9 GiB/GPU
+  free; the VRAM ceiling is roughly ~640k tokens, so 128k is limited by
+  `--max-model-len`, not memory. The single-A10 dense path needs
+  `--cpu-offload-gb 6` for 128k and collapses to ~2.5 tps; TP=2 avoids that
+  offload path.
+- **Dense 27B decode at 128k is ~35 tps projected.** The old ~40–42 tps estimate
+  was the short-context TP=2 projection. At 128k, the 16 fp8 full-attention
+  layers add ~2.0 GiB/GPU of KV read per decoded token on top of the ~9.4 GiB/GPU
+  weight shard. Applying the measured dense efficiency gives ~34–36 tps, so
+  use ~35 tps as the 128k planning number.
 
 - **No offload needed** — ~21.5 GiB / 2 ≈ 11 GiB/GPU weights, ample room for
   KV+state. Removing offload removes the PCIe-stall tax (the 80 %-power ceiling)
@@ -741,7 +758,7 @@ The 2×A10 MoE projection's reasoning:
 | `gpus` | all (1) | all (2) | all (1) | all (2) |
 | `--gpu-memory-utilization` | 0.97 | 0.97 | 0.95 | 0.95–0.97 (more headroom) |
 | `--cpu-offload-gb` | — | — | **2.2** | **drop (no offload needed)** |
-| `--max-model-len` | 64000 | 64000+ | 128000 | **256000 (proj)** |
+| `--max-model-len` | 64000 | **128000 (proj)** | 128000 | **256000 (proj)** |
 | `--max-num-batched-tokens` | 1024 | 1024 | 1280 | 1280 (≥1072 align) |
 | `--max-num-seqs` | 1 | 1 | 1 | 1 |
 | weights / GPU | 18.83 GiB | ~9.4 GiB | ~19.2 GiB (+2.2 off) | ~10.75 GiB |
@@ -753,7 +770,7 @@ The 2×A10 MoE projection's reasoning:
 - `nvidia-smi` per-GPU memory **balanced** (~equal) → TP shards both layer types.
 - `NCCL_DEBUG=INFO` log: `via P2P/IPC` (best) or `via SHM` (fallback, fine);
   `via NET` would indicate TCP (shouldn't happen intra-node).
-- 27B decode ~40–42 tps; 35B MoE decode ~120+ tps at short/moderate context, or
+- 27B Dense decode ~35 tps at 128k; 35B MoE decode ~120+ tps at short/moderate context, or
   materially above 15.4 tps at 256k → no-offload TP is working. MoE stuck near
   15.4 tps means the run is still effectively on the offloaded/single-GPU path,
   TP is not sharding the hybrid layers, or init fell back/failed.
