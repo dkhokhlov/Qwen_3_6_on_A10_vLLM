@@ -40,7 +40,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 240s
-    restart: "no"
+    restart: unless-stopped   # crash (e.g. OOM) auto-restarts; an engine-API stop (idle-stop)
+                              # still sticks; wake-on-request (ensure_up) backstops per request
 
   # LiteLLM sole proxy: Anthropic<->OpenAI translation + three thinking aliases,
   # and owns the vllm lifecycle (wake-on-request, idle-stop). See
@@ -61,11 +62,12 @@ services:
       LITELLM_WORKER_STARTUP_HOOKS: litellm_callbacks:start_background_tasks
       PYTHONPATH: /app
     volumes:
-      - ./litellm_config.yaml:/app/litellm_config.yaml:ro
+      - ./litellm_config.moe.yaml:/app/litellm_config.yaml:ro
       - ./litellm_callbacks.py:/app/litellm_callbacks.py:ro
       - /var/run/docker.sock:/var/run/docker.sock
     command: --config /app/litellm_config.yaml --port 4000 --num_workers 1
-    restart: unless-stopped   # always-on proxy self-heals (only vllm is restart:"no")
+    restart: unless-stopped   # proxy stays up so it can answer + wake vllm; vllm's engine-API
+                              # stop (idle) is honored like a crash is NOT, so power-down works
 
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
