@@ -1,6 +1,6 @@
 services:
   vllm:
-    image: vllm/vllm-openai:nightly
+    image: vllm/vllm-openai:nightly@sha256:9fe761ad1e8258a5e8f1c28243b1567c19b0a78e3a909c72611fdd1771f0f966   # nightly needed for the 35B-A3B Marlin MoE repack (validated 2026-07-07)
     container_name: vllm-qwen35b
     gpus: all
     shm_size: 32g
@@ -43,9 +43,9 @@ services:
     restart: unless-stopped   # crash (e.g. OOM) auto-restarts; an engine-API stop (idle-stop)
                               # still sticks; wake-on-request (ensure_up) backstops per request
 
-  # LiteLLM sole proxy: Anthropic<->OpenAI translation + three thinking aliases,
-  # and owns the vllm lifecycle (wake-on-request, idle-stop). See
-  # litellm_config.yaml + litellm_callbacks.py (ported from sidecar/app.py).
+  # LiteLLM sole proxy: Anthropic<->OpenAI translation + three model names
+  # (bare/-preserve/-nothink), and owns the vllm lifecycle (wake-on-request,
+  # idle-stop). See litellm_config.moe.yaml + litellm_callbacks.py.
   litellm:
     image: ghcr.io/berriai/litellm:main-stable
     container_name: vllm-litellm35b
@@ -65,7 +65,7 @@ services:
       - ./litellm_config.moe.yaml:/app/litellm_config.yaml:ro
       - ./litellm_callbacks.py:/app/litellm_callbacks.py:ro
       - /var/run/docker.sock:/var/run/docker.sock
-    command: --config /app/litellm_config.yaml --port 4000 --num_workers 1
+    command: --config /app/litellm_config.yaml --port 4000
     restart: unless-stopped   # proxy stays up so it can answer + wake vllm; vllm's engine-API
                               # stop (idle) is honored like a crash is NOT, so power-down works
 
