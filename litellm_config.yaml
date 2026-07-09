@@ -23,6 +23,8 @@ model_list:
       api_key: dummy
       extra_body:
         chat_template_kwargs: { preserve_thinking: false }
+    model_info:                       # advertise so Claude Code sizes max_tokens to it, else it defaults to
+      max_output_tokens: 16384        # 32000 -- which + the ~32k system prompt exceeds --max-model-len
   - model_name: claude-sonnet-preserve
     litellm_params:
       model: os.environ/LITELLM_VLLM_MODEL
@@ -30,6 +32,8 @@ model_list:
       api_key: dummy
       extra_body:
         chat_template_kwargs: { preserve_thinking: true }
+    model_info:
+      max_output_tokens: 16384
   - model_name: claude-haiku
     litellm_params:
       model: os.environ/LITELLM_VLLM_MODEL
@@ -37,6 +41,8 @@ model_list:
       api_key: dummy
       extra_body:
         chat_template_kwargs: { enable_thinking: false, preserve_thinking: false }
+    model_info:
+      max_output_tokens: 16384
 
 litellm_settings:
   # Wake-on-request + idle-stop live in litellm_callbacks.start_background_tasks

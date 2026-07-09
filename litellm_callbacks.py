@@ -98,12 +98,27 @@ class Backend:
             log.warning("backend not healthy within %.0fs; will wake on first request",
                         BOOT_TIMEOUT_SECONDS)
 
+    async def _probe(self) -> bool:
+        """Fast liveness check; False if vLLM is down or still booting.
+
+        `_up` is a cache that can go stale when vLLM is stopped by anything
+        OTHER than idle_watch._stop() -- an external `docker stop`, a crash
+        under restart:"no", or a host-driven clean shutdown. Probing before
+        trusting `_up` makes a request self-heal instead of calling into a dead
+        backend (the failure mode where ensure_up short-circuits on a stale
+        `_up=True` and the upstream call dies with "Cannot connect to vllm:8000").
+        """
+        try:
+            return (await self._client.get(f"{BACKEND_URL}/health", timeout=2.0)).status_code == 200
+        except httpx.HTTPError:
+            return False
+
     async def ensure_up(self, force: bool = False) -> None:
         """Start vLLM if it is down; coalesce concurrent callers behind a lock."""
-        if not force and self._up:
+        if not force and self._up and await self._probe():
             return
         async with self._wake_lock:
-            if not force and self._up:
+            if not force and self._up and await self._probe():
                 return
             log.info("waking backend %s", BACKEND_CONTAINER)
             await self._start_if_needed()
