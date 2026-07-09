@@ -1,4 +1,4 @@
-# LiteLLM sole-proxy config for Qwen3.6-27B (dense) on the A10.
+# LiteLLM sole-proxy config for Qwen3.6-35B-A3B (MoE) on the A10.
 #
 # Three REAL model names against ONE vLLM instance. They differ ONLY in
 # extra_body.chat_template_kwargs, which LiteLLM passes through to vLLM and the
@@ -8,15 +8,15 @@
 #   - preserve_thinking whether PRIOR turns' reasoning stays in context (default OFF)
 #
 # One running backend serves all three flavors interleaved. The bare name equals
-# vLLM's --served-model-name (qwen3.6-27b); -preserve / -nothink are the two
-# thinking variants. The MoE stack uses litellm_config.moe.yaml (qwen3.6-35b-a3b).
+# vLLM's --served-model-name (qwen3.6-35b-a3b); -preserve / -nothink are the two
+# thinking variants. The dense stack uses litellm_config.yaml (qwen3.6-27b).
 #
-#   qwen3.6-27b           DEFAULT    strip -- thinking shown this turn, not carried
-#   qwen3.6-27b-preserve  RARE       keep -- carry prior <think> across turns
-#   qwen3.6-27b-nothink   BACKGROUND     -- no reasoning pass (titles/summaries)
+#   qwen3.6-35b-a3b           DEFAULT    strip -- thinking shown this turn, not carried
+#   qwen3.6-35b-a3b-preserve  RARE       keep -- carry prior <think> across turns
+#   qwen3.6-35b-a3b-nothink   BACKGROUND     -- no reasoning pass (titles/summaries)
 
 model_list:
-  - model_name: qwen3.6-27b
+  - model_name: qwen3.6-35b-a3b
     litellm_params:
       model: os.environ/LITELLM_VLLM_MODEL
       api_base: os.environ/LITELLM_VLLM_API_BASE
@@ -25,7 +25,7 @@ model_list:
         chat_template_kwargs: { preserve_thinking: false }
     model_info:                       # advertise so Claude Code sizes max_tokens to it, else it defaults to
       max_output_tokens: 16384        # 32000 -- which + the ~32k system prompt exceeds --max-model-len
-  - model_name: qwen3.6-27b-preserve
+  - model_name: qwen3.6-35b-a3b-preserve
     litellm_params:
       model: os.environ/LITELLM_VLLM_MODEL
       api_base: os.environ/LITELLM_VLLM_API_BASE
@@ -34,7 +34,7 @@ model_list:
         chat_template_kwargs: { preserve_thinking: true }
     model_info:
       max_output_tokens: 16384
-  - model_name: qwen3.6-27b-nothink
+  - model_name: qwen3.6-35b-a3b-nothink
     litellm_params:
       model: os.environ/LITELLM_VLLM_MODEL
       api_base: os.environ/LITELLM_VLLM_API_BASE

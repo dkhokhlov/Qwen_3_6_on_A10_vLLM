@@ -41,7 +41,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 180s
-    restart: "no"   # idle-stop must stick; the LiteLLM callback manages lifecycle
+    restart: unless-stopped   # crash (e.g. OOM) auto-restarts; engine-API stop (idle) still
+                              # sticks; wake-on-request (ensure_up) backstops per request
 
   # LiteLLM sole proxy: Anthropic<->OpenAI translation + three thinking aliases,
   # and owns the vllm lifecycle (wake-on-request, idle-stop). See

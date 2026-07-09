@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
-# Wrap the `opencode` CLI to drive local Qwen3.6-27B (dense, via the LiteLLM sole
-# proxy) as an OpenAI-compatible backend.
+# Wrap the `opencode` CLI to drive local Qwen3.6-35B-A3B (MoE, via the LiteLLM
+# sole proxy) as an OpenAI-compatible backend.
 #
 # opencode can't be pointed at a custom endpoint by env alone: it ignores
 # OPENAI_BASE_URL for its built-in `openai` provider. So we hand it a dedicated
 # openai-compatible provider via a PRIVATE XDG_CONFIG_HOME -- a COPY of
-# opencode-qwen.json from this repo. That isolates this session from your global
-# ~/.config/opencode/opencode.json (Kimi/cloud default): no leak to a cloud
+# opencode-qwen-moe.json from this repo. That isolates this session from your
+# global ~/.config/opencode/opencode.json (Kimi/cloud default): no leak to a cloud
 # gateway, no change to plain `opencode`. (A copy, not a symlink, so any write-back
 # opencode does lands on the disposable copy, not the committed file.)
 #
-# Stack  = which wrapper: this one targets the 27B dense stack (make start);
-#          opencode-qwen-moe targets the 35B MoE stack (make start35).
+# Stack  = which wrapper: this one targets the 35B MoE stack (make start35);
+#          opencode-qwen targets the 27B dense stack (make start).
 # Flavor = QWEN_FLAVOR (default | preserve | nothink); empty/default = strip.
-#          Switch mid-session with /model litellm/qwen3.6-27b[-preserve|-nothink].
+#          Switch mid-session with /model litellm/qwen3.6-35b-a3b[-preserve|-nothink].
 # The -nothink variant is the config's small_model (background tasks never reason).
 #
 # The proxy is auth-free (0.0.0.0:4000), so apiKey is a placeholder. First run may
 # pull the @ai-sdk/openai-compatible npm provider (one-time).
 set -euo pipefail
 
-BASE="qwen3.6-27b"                       # dense; opencode-qwen-moe uses qwen3.6-35b-a3b
+BASE="qwen3.6-35b-a3b"                   # MoE; opencode-qwen uses qwen3.6-27b
 case "${QWEN_FLAVOR:-default}" in
   default)  FLAVOR="" ;;
   preserve) FLAVOR="-preserve" ;;
@@ -29,10 +29,10 @@ case "${QWEN_FLAVOR:-default}" in
 esac
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-CONF="$REPO/opencode-qwen.json"
+CONF="$REPO/opencode-qwen-moe.json"
 
 # Private, per-stack config home so opencode reads OUR provider, not the global one.
-HOME_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/opencode-qwen"
+HOME_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/opencode-qwen-moe"
 mkdir -p "$HOME_DIR/opencode"
 cp -f "$CONF" "$HOME_DIR/opencode/opencode.json"
 export XDG_CONFIG_HOME="$HOME_DIR"

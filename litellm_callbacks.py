@@ -64,6 +64,52 @@ def _metric(line: str) -> int:
     return int(float(line.split()[-1]))
 
 
+def _extract_reasoning(message: dict) -> str | None:
+    """Pull prior-turn reasoning out of an assistant message, Anthropic or OpenAI shape.
+
+    The /v1/messages adapter attaches Anthropic `thinking_blocks` -- a list of
+    {"type":"thinking","thinking":"..."}; the OpenAI path uses a top-level
+    `reasoning` string. vLLM's qwen3 chat_template renders PRIOR reasoning only
+    from `reasoning_content`, so either must be normalized to that key.
+    """
+    parts: list[str] = []
+    blocks = message.get("thinking_blocks")
+    if isinstance(blocks, list):
+        for b in blocks:
+            if isinstance(b, dict):
+                t = b.get("thinking") or b.get("text")
+                if isinstance(t, str) and t:
+                    parts.append(t)
+    if not parts:
+        r = message.get("reasoning")
+        if isinstance(r, str) and r:
+            parts.append(r)
+    return "\n".join(parts) if parts else None
+
+
+def _preserve_requested(kwargs: dict) -> str | None:
+    """The alias (or flag) marking this a `-preserve` request, else None.
+
+    `kwargs["model"]` at the deployment hook is usually the client-facing alias,
+    but it can land as the deployment model (hosted_vllm/...). Probe model group
+    across the places litellm stashes it, then fall back to the actual
+    chat_template_kwarg, so the gate never silently no-ops on the wrong field.
+    """
+    for key in ("model", "model_group"):
+        v = kwargs.get(key)
+        if isinstance(v, str) and v.endswith("-preserve"):
+            return v
+    md = kwargs.get("metadata")
+    v = md.get("model_group") if isinstance(md, dict) else None
+    if isinstance(v, str) and v.endswith("-preserve"):
+        return v
+    eb = kwargs.get("extra_body")
+    ctk = eb.get("chat_template_kwargs") if isinstance(eb, dict) else None
+    if isinstance(ctk, dict) and ctk.get("preserve_thinking") is True:
+        return "<preserve_thinking=true>"
+    return None
+
+
 class Backend:
     """vLLM lifecycle: start on demand, stop after sustained inference-idle."""
 
@@ -210,12 +256,19 @@ _tasks: set[asyncio.Task] = set()
 
 
 class Handler(CustomLogger):
-    """Wake the backend before a completion, on both proxy paths.
+    """Wake the backend before a completion (both proxy paths) and, for `-preserve`
+    models, re-attach prior-turn reasoning the adapter would otherwise drop.
 
-    Two hooks because the router and the Anthropic pass-through dispatch
-    different pre-call hooks (see module docstring). Each is a thin wrapper over
-    backend.ensure_up(), which is a no-op once the backend is already up; both
-    return None so the request passes through unmodified.
+    The two wake hooks exist because the router and the Anthropic pass-through
+    dispatch different pre-call hooks (see module docstring); each just calls
+    backend.ensure_up() (a no-op once up) and returns None.
+
+    The deployment hook fires inside wrapper_async AFTER the adapter produced
+    OpenAI-shape kwargs (utils.py:1606) -- the only point where a reasoning_content
+    set here reaches vLLM: on /v1/messages, async_pre_call_hook sees Anthropic-shape
+    data and the adapter rebuilds prior assistant turns with thinking_blocks (never
+    reasoning_content) AFTER it, so the qwen3 template's prior-reasoning render
+    would be empty without this. See the method below.
     """
 
     # Router path: /v1/chat/completions (+ /v1/completions, /v1/embeddings...).
@@ -226,6 +279,50 @@ class Handler(CustomLogger):
     # Pass-through path: /v1/messages (anthropic_messages -> _execute_pre_request_hooks).
     async def async_pre_request_hook(self, model, messages, kwargs):
         await backend.ensure_up()
+        return None
+
+    # Both endpoints, after Anthropic->OpenAI conversion. The qwen3 template renders
+    # PRIOR reasoning only from `reasoning_content`; the adapter attaches Anthropic
+    # thinking_blocks instead, so a -preserve request would lose every prior <think>.
+    # Normalize thinking_blocks/reasoning -> reasoning_content on prior assistant
+    # turns. Return contract (utils.py:1139): return kwargs to apply it, None to skip.
+    # The INFO line is also the verify-probe: counts reveal whether the client strips
+    # older turns' thinking (n_tb=0 -> cache needed) vs mapping alone suffices.
+    async def async_pre_call_deployment_hook(self, kwargs, call_type):
+        alias = _preserve_requested(kwargs)
+        if alias is None:
+            return None
+        messages = kwargs.get("messages") or []
+        rebuilt: list = []
+        n_tb = n_rs = n_rc = n_set = 0
+        for m in messages:
+            if not (isinstance(m, dict) and m.get("role") == "assistant"):
+                rebuilt.append(m)
+                continue
+            if m.get("reasoning_content"):
+                n_rc += 1
+                rebuilt.append(m)
+                continue
+            if isinstance(m.get("thinking_blocks"), list) and m["thinking_blocks"]:
+                n_tb += 1
+            if isinstance(m.get("reasoning"), str) and m["reasoning"]:
+                n_rs += 1
+            rc = _extract_reasoning(m)
+            if rc:
+                nm = dict(m)
+                nm["reasoning_content"] = rc
+                rebuilt.append(nm)
+                n_set += 1
+            else:
+                rebuilt.append(m)
+        log.info(
+            "preserve hook: alias=%s msgs=%d prior-assistant thinking_blocks=%d "
+            "reasoning=%d had_rc=%d set_rc=%d",
+            alias, len(messages), n_tb, n_rs, n_rc, n_set,
+        )
+        if n_set:
+            kwargs["messages"] = rebuilt
+            return kwargs
         return None
 
 
