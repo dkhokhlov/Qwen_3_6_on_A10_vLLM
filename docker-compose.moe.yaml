@@ -31,7 +31,7 @@ services:
       --enforce-eager
       --enable-prefix-caching
       --enable-auto-tool-choice
-      --tool-call-parser hermes
+      --tool-call-parser qwen3_xml
       --reasoning-parser qwen3
       --trust-remote-code
     healthcheck:
@@ -67,5 +67,20 @@ services:
     command: --config /app/litellm_config.yaml --port 4000 --num_workers 1
     restart: unless-stopped   # always-on proxy self-heals (only vllm is restart:"no")
 
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    ports:
+      - "3000:8080"
+    environment:
+      OPENAI_API_BASE_URL: http://litellm:4000/v1
+      OPENAI_API_KEY: anything
+    volumes:
+      - open-webui-data:/app/backend/data
+    depends_on:
+      - litellm
+    restart: unless-stopped
+
 volumes:
+  open-webui-data:
   vllm_cache_moe:
