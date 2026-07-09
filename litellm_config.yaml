@@ -39,10 +39,15 @@ model_list:
         chat_template_kwargs: { enable_thinking: false, preserve_thinking: false }
 
 litellm_settings:
-  callbacks: litellm_callbacks.handler   # wake-on-request + idle-stop, ported from sidecar/app.py
+  # Wake-on-request + idle-stop live in litellm_callbacks.start_background_tasks
+  # (a startup hook that appends a CustomLogger to litellm.callbacks). NOT
+  # litellm_settings.callbacks: LiteLLM's config-string resolver only matches
+  # built-in integration names, so a custom `module.handler` string is a silent
+  # no-op. The handler overrides BOTH async_pre_call_hook (router /v1/chat/
+  # completions) and async_pre_request_hook (Anthropic /v1/messages pass-through).
   # No master_key -> auth is OFF and :4000 is bound 0.0.0.0, so any network host
   # can call the proxy (operator's explicit choice; see README Security).
   # open-webui and the bench need no API key; Claude Code sends a placeholder token.
   drop_params: true                       # drop Claude Code params vLLM rejects -> no 400s
-  request_timeout: 600                    # generous; cold wake happens in the pre-call hook
+  request_timeout: 600                    # generous; cold wake happens in the middleware
   num_workers: 1                          # one idle-watcher, one wake-lock owner

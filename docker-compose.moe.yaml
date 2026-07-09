@@ -58,7 +58,7 @@ services:
       IDLE_SECONDS: "${VLLM_IDLE_SECONDS:-900}"
       POLL_SECONDS: "${VLLM_POLL_SECONDS:-10}"
       WAKE_TIMEOUT_SECONDS: "${VLLM_WAKE_TIMEOUT:-300}"
-      LITELLM_WORKER_STARTUP_HOOKS: litellm_callbacks.start_background_tasks
+      LITELLM_WORKER_STARTUP_HOOKS: litellm_callbacks:start_background_tasks
       PYTHONPATH: /app
     volumes:
       - ./litellm_config.yaml:/app/litellm_config.yaml:ro

@@ -1,17 +1,34 @@
 #!/usr/bin/env python3
-"""LiteLLM callback owning the vLLM backend lifecycle (wake-on-request + idle-stop).
+"""LiteLLM proxy plugin: wake vLLM on request + idle-stop it (lifecycle ported
+from sidecar/app.py, the verified idle gate).
 
-Ported from sidecar/app.py (the verified idle gate). Runs inside the LiteLLM proxy
-image, which ships httpx but NOT the docker SDK, so container control talks to the
-Engine API over the mounted /var/run/docker.sock instead of the `docker` package.
+Wiring
+  env LITELLM_WORKER_STARTUP_HOOKS=litellm_callbacks:start_background_tasks
+  runs inside proxy_startup_event (the Uvicorn lifespan). It:
+    1. boots the idle watcher + a startup health bootstrap, and
+    2. registers a CustomLogger that wakes the backend before any completion.
 
-Two entrypoints consumed by litellm_config.yaml:
-  - litellm_settings.callbacks: litellm_callbacks.handler
-        async_pre_call_hook wakes vLLM before each completion.
-  - env LITELLM_WORKER_STARTUP_HOOKS=litellm_callbacks.start_background_tasks
-        bootstrap() marks the warm-started backend UP; idle_watch() stops it after
-        IDLE_SECONDS of inference-idle.  (The startup-hook loader uses plain
-        importlib.import_module, so the compose service sets PYTHONPATH=/app.)
+Why a registered CustomLogger with TWO hooks, not litellm_settings.callbacks:
+  - LiteLLM's config-string callback resolver only matches BUILT-IN integration
+    names (langfuse/otel/...); an arbitrary `module.handler` string is left as a
+    bare string and NEVER imported, so the hook silently never fires. The proxy
+    has no auto-import path for a custom callback module. Fix: append the INSTANCE
+    to litellm.callbacks from the startup hook (after LiteLLM has finished loading).
+  - The two completion paths dispatch DIFFERENT pre-call hooks, so Handler
+    overrides both:
+      * router        /v1/chat/completions -> async_pre_call_hook
+        (dispatched from ProxyLogging via _callback_capabilities, which reads
+        litellm.callbacks live and recomputes on membership change)
+      * pass-through  /v1/messages         -> async_pre_request_hook
+        (anthropic_messages -> _execute_pre_request_hooks iterates
+        litellm.callbacks directly, before the upstream call)
+  Both hooks just call backend.ensure_up(); returning None leaves the request
+  unmodified. Waking here fires ONLY on real LLM calls, so /v1/models, /health,
+  /metrics (served cold from config) never wake vLLM.
+
+Container control talks to the Engine API over the mounted /var/run/docker.sock
+via httpx (the litellm image ships no docker SDK). The startup-hook loader uses
+plain importlib.import_module, so the compose service sets PYTHONPATH=/app.
 """
 from __future__ import annotations
 
@@ -21,9 +38,16 @@ import os
 import time
 
 import httpx
+import litellm
 from litellm.integrations.custom_logger import CustomLogger
 
 log = logging.getLogger("litellm_callbacks")
+# Force the lifecycle logger to emit at INFO regardless of the root level, so
+# wake/stop events show up in `make litellm-logs` (LiteLLM otherwise leaves this
+# child logger below WARNING and the events are invisible).
+if not log.handlers:
+    log.addHandler(logging.StreamHandler())
+log.setLevel(logging.INFO)
 
 BACKEND_CONTAINER = os.environ.get("BACKEND_CONTAINER", "vllm-qwen")
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://vllm:8000").rstrip("/")
@@ -164,38 +188,42 @@ class Backend:
                 log.exception("idle_watch iteration failed: %s", exc)
 
 
-class Handler(CustomLogger):
-    """LiteLLM CustomLogger: wake the backend before each completion."""
-
-    def __init__(self) -> None:
-        self.backend = Backend()
-
-    async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
-        # Fires only on real LLM calls (not LiteLLM's own /v1/models, /health), so
-        # background pollers cannot keep the GPU awake. Wake is coalesced via a lock.
-        #
-        # NOTE on claude-sonnet-preserve: preserve_thinking only re-renders prior
-        # reasoning that is actually present in the incoming messages. Claude Code /
-        # LiteLLM may strip prior assistant thinking from history, or name the field
-        # `reasoning` whereas the Qwen3.6 template reads `reasoning_content`. Verify
-        # at bench whether thinking round-trips; if not, re-inject HERE for the
-        # preserve alias only -- set reasoning_content on prior assistant messages
-        # where absent (idempotent), then `return data` so LiteLLM updates the body.
-        # Left unimplemented until the /v1/messages thinking path is confirmed.
-        await self.backend.ensure_up()
-        return None  # proceed unchanged
-
-
-# CustomLogger instance the callback loader resolves as litellm_callbacks.handler.
-handler = Handler()
+backend = Backend()
 
 # Strong-ref so the asyncio scheduler doesn't GC the background tasks.
 _tasks: set[asyncio.Task] = set()
 
 
+class Handler(CustomLogger):
+    """Wake the backend before a completion, on both proxy paths.
+
+    Two hooks because the router and the Anthropic pass-through dispatch
+    different pre-call hooks (see module docstring). Each is a thin wrapper over
+    backend.ensure_up(), which is a no-op once the backend is already up; both
+    return None so the request passes through unmodified.
+    """
+
+    # Router path: /v1/chat/completions (+ /v1/completions, /v1/embeddings...).
+    async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+        await backend.ensure_up()
+        return None
+
+    # Pass-through path: /v1/messages (anthropic_messages -> _execute_pre_request_hooks).
+    async def async_pre_request_hook(self, model, messages, kwargs):
+        await backend.ensure_up()
+        return None
+
+
 async def start_background_tasks() -> None:
     """LITELLM_WORKER_STARTUP_HOOKS entrypoint (run inside the lifespan loop)."""
-    for coro in (handler.backend.bootstrap(), handler.backend.idle_watch()):
+    for coro in (backend.bootstrap(), backend.idle_watch()):
         t = asyncio.create_task(coro)
         _tasks.add(t)
         t.add_done_callback(_tasks.discard)
+    # Append the wake hook to litellm.callbacks (NOT the config string -- the
+    # resolver never imports custom modules). Both dispatch sites read this list:
+    # the router via _callback_capabilities (recomputed on membership change),
+    # the pass-through directly. Idempotent in case the hook ever re-runs.
+    if not any(isinstance(c, Handler) for c in litellm.callbacks):
+        litellm.callbacks.append(Handler())
+        log.info("wake handler registered on litellm.callbacks")
