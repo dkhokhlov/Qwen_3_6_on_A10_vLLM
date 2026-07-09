@@ -110,12 +110,16 @@ def stream_turn(base_url, model, messages, max_tokens, timeout):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    # Through the LiteLLM sole proxy (vLLM is internal-only); the -nothink model
-    # variant skips reasoning, so decode/prefill TPS are measured without thinking tokens.
-    # Cache counters are read from /metrics; vLLM's /metrics is not proxied by LiteLLM,
-    # so when base-url is the proxy they come back absent -> hit% reads 0 (TPS still valid).
-    ap.add_argument("--base-url", default="http://localhost:4000/v1")
-    ap.add_argument("--model", default="qwen3.6-27b-nothink")
+    # Defaults to vLLM directly (http://localhost:8000) so prefix-cache hit% is real
+    # (read from vLLM /metrics). The -nothink intent is handled per-request via
+    # chat_template_kwargs.enable_thinking=false below, so decode/prefill TPS are measured
+    # without thinking tokens. Point --base-url at the LiteLLM proxy (:4000) to exercise
+    # translation; then hit% reads 0 -- the proxy's /metrics is its own Prometheus, not vLLM's.
+    ap.add_argument("--base-url", default="http://localhost:8000/v1",
+                    help="vLLM directly by default so prefix-cache hit% is real (read from vLLM /metrics). "
+                         "Point at the LiteLLM proxy (http://localhost:4000/v1) to exercise translation; "
+                         "then hit% reads 0 -- the proxy's /metrics is its own Prometheus, not vLLM's.")
+    ap.add_argument("--model", default="qwen3.6-27b")
     ap.add_argument("--turns", type=int, default=8)
     ap.add_argument("--input-tokens", type=int, default=2000,
                     help="target size of each new user message (approx)")
