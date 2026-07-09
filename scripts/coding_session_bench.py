@@ -110,12 +110,12 @@ def stream_turn(base_url, model, messages, max_tokens, timeout):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    # Through the LiteLLM sole proxy (vLLM is internal-only); claude-haiku is the
-    # no-reasoning alias, so decode/prefill TPS are measured without thinking tokens.
+    # Through the LiteLLM sole proxy (vLLM is internal-only); the -nothink model
+    # variant skips reasoning, so decode/prefill TPS are measured without thinking tokens.
     # Cache counters are read from /metrics; vLLM's /metrics is not proxied by LiteLLM,
     # so when base-url is the proxy they come back absent -> hit% reads 0 (TPS still valid).
     ap.add_argument("--base-url", default="http://localhost:4000/v1")
-    ap.add_argument("--model", default="claude-haiku")
+    ap.add_argument("--model", default="qwen3.6-27b-nothink")
     ap.add_argument("--turns", type=int, default=8)
     ap.add_argument("--input-tokens", type=int, default=2000,
                     help="target size of each new user message (approx)")
