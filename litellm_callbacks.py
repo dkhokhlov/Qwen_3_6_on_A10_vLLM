@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""LiteLLM proxy plugin: wake vLLM on request + idle-stop it (lifecycle ported
-from sidecar/app.py, the verified idle gate).
+"""LiteLLM proxy plugin: wake vLLM on request + idle-stop it.
 
 Wiring
   env LITELLM_WORKER_STARTUP_HOOKS=litellm_callbacks:start_background_tasks
@@ -160,11 +159,19 @@ class Backend:
             return False
 
     async def ensure_up(self, force: bool = False) -> None:
-        """Start vLLM if it is down; coalesce concurrent callers behind a lock."""
+        """Start vLLM if it is down; coalesce concurrent callers behind a lock.
+
+        On the hot path (already up) we still reset idle_since: a request is now
+        in flight, so the idle timer must be pushed out before vLLM registers
+        the request in /metrics -- otherwise idle_watch could stop the backend
+        in the handoff window (a race at the IDLE_SECONDS boundary).
+        """
         if not force and self._up and await self._probe():
+            self.idle_since = None
             return
         async with self._wake_lock:
             if not force and self._up and await self._probe():
+                self.idle_since = None
                 return
             log.info("waking backend %s", BACKEND_CONTAINER)
             await self._start_if_needed()

@@ -49,9 +49,10 @@ litellm_settings:
   # (a startup hook that appends a CustomLogger to litellm.callbacks). NOT
   # litellm_settings.callbacks: LiteLLM's config-string resolver only matches
   # built-in integration names, so a custom `module.handler` string is a silent
-  # no-op. The handler overrides async_pre_call_hook (wake, both endpoints) and
-  # async_pre_call_deployment_hook (preserve-thinking round-trip); see
-  # litellm_callbacks.py.
+  # no-op. The handler wakes the backend on both proxy paths (router
+  # /v1/chat/completions -> async_pre_call_hook; pass-through /v1/messages ->
+  # async_pre_request_hook) and runs async_pre_call_deployment_hook for the
+  # preserve-thinking round-trip; see litellm_callbacks.py.
   # No master_key -> auth is OFF and :4000 is bound 0.0.0.0, so any network host
   # can call the proxy (operator's explicit choice; see README Security).
   # open-webui and the bench need no API key; Claude Code sends a placeholder token.
