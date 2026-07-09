@@ -1,8 +1,10 @@
 services:
   vllm:
-    image: vllm/vllm-openai:v0.24.0
+    image: vllm/vllm-openai:nightly@sha256:9fe761ad1e8258a5e8f1c28243b1567c19b0a78e3a909c72611fdd1771f0f966   # matches docker-compose.moe.yaml — one vLLM version across both stacks
     container_name: vllm-qwen
     gpus: all
+    ports:
+      - "0.0.0.0:8000:8000"   # metrics + harness endpoint (overhead testing); chat still via the proxy (:4000)
     ipc: host
     shm_size: 32g
     environment:

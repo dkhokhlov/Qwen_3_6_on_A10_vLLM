@@ -76,6 +76,7 @@ one before starting the other.
 - Claude Code: `./bin/claude-qwen` / `./bin/claude-qwen-moe` (see *Drive it with Claude Code*)
 - opencode: `./bin/opencode-qwen` / `./bin/opencode-qwen-moe` (see *Drive it with opencode*)
 - open-webui: `http://localhost:3000/`
+- vLLM direct (metrics + harness): `http://localhost:8000` — LAN-open; `/metrics` (prefix-cache hit%) + raw OpenAI API for test harnesses. Chat clients use the proxy (`:4000`), not this.
 
 The coding-session bench (`scripts/coding_session_bench.py`) streams a chat that
 grows one ~2k-token user message + ~500-token assistant reply per turn and
@@ -95,14 +96,16 @@ TPS, and prefix-cache hit %. Cache hit is read from vLLM `/metrics` (at the
 | `bin/opencode-qwen` / `-moe` | opencode wrappers: private `XDG_CONFIG_HOME` pointing at our provider |
 | `opencode-qwen.json` / `-moe.json` | opencode provider config the wrappers copy from (baseURL, model limits) |
 | `Makefile` | `run` / `start` / `stop` / `run35` / `start35` / `stop35` / `bench` / `bench35` / `bench_pcie` / `idle-test` / `litellm-logs` / `litellm-logs35` |
-| `scripts/coding_session_bench.py` | growing coding-session bench via the proxy (prefill/output tps; cache hit via `/metrics`) |
+| `scripts/coding_session_bench.py` | growing coding-session bench against vLLM (prefill/output tps; prefix-cache hit via `/metrics`). Defaults to vLLM (`:8000`) for real hit%; via the proxy (`:4000`) `hit%` reads 0 |
 | `scripts/pcie_bw_bench.py` | GPU↔host PCIe D2H/H2D bandwidth + TP=2 all-reduce estimate |
 
 ### Security
 
 The proxy binds `0.0.0.0:4000` (LAN-reachable) with auth **disabled** and mounts
-`/var/run/docker.sock` read-write (root-equivalent host control). Treat any host
-that can reach `:4000` as trusted — this is deliberate; see
+`/var/run/docker.sock` read-write (root-equivalent host control). vLLM is also
+published on `0.0.0.0:8000` (raw OpenAI API + `/metrics`; no socket mount, but
+unauthenticated inference). Treat any host that can reach `:4000` or `:8000` as
+trusted — this is deliberate; see
 [Tuning & security](#tuning--security) for the full exposure and how to lock it down.
 
 ## Part 2 — Single-A10 Deployments
@@ -474,6 +477,11 @@ Measured envelope (QuantTrio, vLLM nightly, `--language-model-only`,
 | 2.2 | 0.97 | 160 000 | on | 2048 | 192 820 | ~14 | short-prompt only — OOMs on real prefill |
 | **2.2** | **0.95** | **128 000** | **on** | **1280** | **150 349** | **~15.5** | **WORKS — real prefill to 128k, prefix-cache 98 % hit** |
 
+**Why nightly.** Both composes pin the same image, `vllm/vllm-openai:nightly@sha256:9fe761ad…`.
+The MoE requires nightly for `awq_marlin_moe_repack` (the 35B-A3B Marlin repack above); the
+dense 27B — previously `v0.24.0` — rides the same image so both stacks run one vLLM version
+(re-validated on nightly: `make bench` hit% 0→78, out_tps ≈ 21).
+
 > The top 4 rows only tested a 16-token prompt; they OOM on the first real
 > (>1k-token) prefill. Root cause: vLLM under-reserves runtime overhead for this
 > hybrid MoE — it estimates ~0.30 GiB reserve but the real overhead is ~0.93 GiB
@@ -621,11 +629,14 @@ After a stop the card re-downshifts P0→P8 within ~30 s, then settles to ~15 W.
 | wake after idle (OS caches warm) | 32 s | 53 s |
 | `WAKE_TIMEOUT_SECONDS` budget | 240 s | 300 s |
 
-**Topology.** The `vllm` service publishes **no host port**; LiteLLM reaches it
-over the compose network at `http://vllm:8000`. LiteLLM binds
-`0.0.0.0:4000:4000` (LAN-accessible — see *Security*). open-webui points at
-`http://litellm:4000/v1`. Local clients, `make bench`, and `bin/claude-qwen` hit
-`http://localhost:4000`; remote hosts hit the box's LAN IP (override
+**Topology.** The `vllm` service publishes `0.0.0.0:8000:8000` (LAN-open — see
+*Security*): `/metrics` (prefix-cache hit%) and the raw OpenAI API for test
+harnesses/overhead measurement. Chat clients do **not** use it — they go through
+the proxy. LiteLLM still reaches vLLM over the compose network at
+`http://vllm:8000` and binds `0.0.0.0:4000:4000` (LAN-accessible). open-webui points at
+`http://litellm:4000/v1`. `make bench` hits vLLM directly
+(`http://localhost:8000`) so its `hit%` is real; `bin/claude-qwen` /
+`bin/opencode-qwen` hit the proxy (`http://localhost:4000`). Remote hosts hit the box's LAN IP (override
 `ANTHROPIC_BASE_URL` / `OPENAI_API_BASE_URL`).
 
 #### Endpoints
@@ -754,7 +765,10 @@ from the LAN, by design) and auth is **disabled** (no `master_key`: open-webui,
 the bench, and remote Claude Code hosts need no API key). The service also mounts
 `/var/run/docker.sock` read-write (start/stop needs write, which is root-equivalent
 host control). Net effect: **any host that can reach `:4000` can start/stop
-arbitrary containers on this box** — treat the network as trusted. To put a key in
+arbitrary containers on this box** — treat the network as trusted. vLLM's
+`0.0.0.0:8000` is the same posture but lighter: it exposes the OpenAI API and
+`/metrics` (unauthenticated inference + prefix-cache counters), not the Docker
+socket. To put a key in
 front later, set `master_key` in `litellm_config.yaml` and point clients'
 `ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY` at it; that gates the API, not the socket,
 so also tighten to `127.0.0.1:4000` once you stop needing remote access.
@@ -788,14 +802,14 @@ block size set by the mamba page alignment:
   than ollama's small-segment cache, which is why tiny prompts hit on ollama but
   not here. For real chat (system prompt + history >> block size) it
   matches/beats ollama.
-- **Measure via `/metrics` at the root**, not `/v1/metrics`. vLLM is internal-only
-  now (no host port), so reach it through compose:
-  `docker compose exec vllm curl -s localhost:8000/metrics` (or `-f
-  docker-compose.moe.yaml exec vllm ...` for the MoE). Counters:
+- **Measure via `/metrics` at the root**, not `/v1/metrics`. vLLM publishes
+  `:8000`, so read it directly: `curl -s localhost:8000/metrics` (or
+  `docker compose exec vllm curl -s localhost:8000/metrics` from inside the net). Counters:
   `vllm:prefix_cache_queries_total`, `vllm:prefix_cache_hits_total` (cumulative
-  token counts). v0.24.0 returns `usage.prompt_tokens_details: null`, so usage
-  can't be used for hit rate. (`make bench` can't read these through the LiteLLM
-  proxy, so its `hit%` column reads 0 — TPS/TTFT are still valid.)
+  token counts). `usage.prompt_tokens_details` is `null`, so usage
+  can't be used for hit rate. `make bench` defaults to vLLM (`:8000`), so its
+  `hit%` column is real; point it at the proxy (`:4000`) and `hit%` reads 0
+  (LiteLLM's `/metrics` has no vLLM counters — TPS/TTFT still valid).
 
 #### The reported `hit_rate` lags the real per-turn hit
 

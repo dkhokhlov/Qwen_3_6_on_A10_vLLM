@@ -30,8 +30,8 @@ stop35: ## Stop the 35B MoE stack (containers kept, not removed)
 bench: ## Run the growing coding-session bench (override with TURNS=N)
 	$(PY) $(BENCH) --turns $(TURNS)
 
-bench35: ## Bench the 35B MoE stack via the LiteLLM proxy (qwen3.6-35b-a3b-nothink; override with TURNS=N)
-	$(PY) $(BENCH) --model qwen3.6-35b-a3b-nothink --turns $(TURNS)
+bench35: ## Bench the 35B MoE stack via vLLM (qwen3.6-35b-a3b; override with TURNS=N)
+	$(PY) $(BENCH) --model qwen3.6-35b-a3b --turns $(TURNS)
 
 bench_pcie: ## Measure GPU<->host PCIe bandwidth (free GPU needed: `make stop` first)
 	$(PY) scripts/pcie_bw_bench.py
