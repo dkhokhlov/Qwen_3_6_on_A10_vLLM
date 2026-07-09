@@ -31,6 +31,7 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 - [AWQ quantization — the method, and why both models use it](#awq-quantization--the-method-and-why-both-models-use-it)
 - [Deployment A — Qwen3.6-27B-AWQ (Dense)](#deployment-a--qwen36-27b-awq-dense)
 - [Deployment B — Qwen3.6-35B-A3B-AWQ (MoE)](#deployment-b--qwen36-35b-a3b-awq-moe)
+- [Idle power-down — the LiteLLM sole proxy](#idle-power-down--the-litellm-sole-proxy)
 - [Prefix caching](#prefix-caching)
 - [PCIe bandwidth — grounding the TP=2-on-x4 question](#pcie-bandwidth--grounding-the-tp2-on-x4-question)
 - [Two A10 cards — TP=2 projections for Dense and MoE](#two-a10-cards--tp2-projections-for-dense-and-moe)
@@ -55,12 +56,14 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 
 `run`/`start`/`stop` target the 27B Dense stack (`docker-compose.yaml`);
 `run35`/`start35`/`stop35` target the 35B MoE stack (`docker-compose.moe.yaml`).
-The two stacks use the same port (8000) and container name prefix, so stop one
-before starting the other.
+The two stacks share host port `4000` (the LiteLLM proxy) and the one GPU, so stop
+one before starting the other.
 
-- vLLM OpenAI API: `http://localhost:8000/v1`
-  - 27B served-model-name: `qwen3.6-27b`
-  - 35B MoE served-model-name: `qwen3.6-35b-a3b`
+- LiteLLM proxy (host-facing, localhost): `http://localhost:4000`
+  - Anthropic `/v1/messages` **and** OpenAI `/v1/*` — same base
+  - aliases: `claude-sonnet` (default), `claude-sonnet-preserve`, `claude-haiku`
+  - backend served-model-names (internal only): `qwen3.6-27b` / `qwen3.6-35b-a3b`
+- Claude Code: `./bin/claude-qwen` (sets `ANTHROPIC_*` env, execs `claude`; see *Idle power-down*)
 - open-webui: `http://localhost:3000/`
 
 The coding-session bench (`scripts/coding_session_bench.py`) streams a chat that
@@ -73,11 +76,15 @@ TPS, and prefix-cache hit %. Cache hit is read from vLLM `/metrics` (at the
 
 | file | what |
 |---|---|
-| `docker-compose.yaml` | vLLM (27B Dense) + open-webui stack |
-| `docker-compose.moe.yaml` | vLLM (35B MoE, 128k, 2.2 GiB offload) stack |
-| `Makefile` | `run` / `start` / `stop` / `run35` / `start35` / `stop35` / `bench` / `bench35` / `bench_pcie` |
-| `scripts/coding_session_bench.py` | growing coding-session bench (prefill/output tps, cache hit from `/metrics`) |
+| `docker-compose.yaml` | vLLM (27B Dense) + LiteLLM sole proxy + open-webui stack |
+| `docker-compose.moe.yaml` | vLLM (35B MoE, 128k, 2.2 GiB offload) + LiteLLM stack |
+| `litellm_config.yaml` | LiteLLM config: three thinking aliases, one shared backend (env-driven) |
+| `litellm_callbacks.py` | custom callback: wake-on-request + idle-stop (ported from `sidecar/app.py`) |
+| `bin/claude-qwen` | Claude Code wrapper: sets `ANTHROPIC_*` env, execs `claude` against the proxy |
+| `Makefile` | `run` / `start` / `stop` / `run35` / `start35` / `stop35` / `bench` / `bench35` / `bench_pcie` / `idle-test` / `litellm-logs` / `litellm-logs35` |
+| `scripts/coding_session_bench.py` | growing coding-session bench via the LiteLLM proxy (prefill/output tps; cache hit internal-only now) |
 | `scripts/pcie_bw_bench.py` | GPU↔host PCIe D2H/H2D bandwidth + TP=2 all-reduce estimate |
+| `sidecar/` | retired idle gate (predecessor of `litellm_callbacks.py`); kept for reference/revert |
 | `README.md` | this doc |
 
 ## TL;DR — one A10, both models
@@ -552,6 +559,175 @@ feature. (FP8 *KV* via FlashInfer works on Ampere and is used here.)
 
 ---
 
+## Idle power-down — the LiteLLM sole proxy
+
+Both stacks put **LiteLLM** (`ghcr.io/berriai/litellm:main-stable`) in front of
+vLLM as the single host-facing service on `0.0.0.0:4000`. It owns three things:
+
+1. **Translation** — Anthropic `/v1/messages` ↔ OpenAI `/v1/chat/completions`, so
+   Claude Code drives local Qwen3.6 as if it were Anthropic (see *Drive it with
+   Claude Code*). LiteLLM also normalizes the `ctx`/`msg`/`system` roles newer
+   Claude Code injects, which vLLM's native `/v1/messages` rejects with 400.
+2. **Thinking aliases** — three model names against one vLLM instance, differing
+   only in `chat_template_kwargs` (see *Thinking*); switchable via Claude Code's
+   `/model`.
+3. **The vLLM lifecycle** — a custom callback (`litellm_callbacks.py`, ported
+   from the previous `sidecar/` gate) wakes the backend on request and
+   `docker stop`s it after 15 min of inference-idle.
+
+**Goal, met: after 15 min idle the A10 draws ~15 W (< 50 W target).**
+
+**Why stop/start, not vLLM sleep mode.** vLLM's sleep mode
+(`--enable-sleep-mode`, `POST /sleep?level=1`) frees VRAM but keeps the process
+and CUDA context resident — that is exactly what makes wake-up fast, but a live
+context holds the GPU out of its lowest P-state. An *asleep* vLLM still draws
+~45–60 W (borderline vs < 50 W, and version-fragile — sleep-mode memory-freeing
+has regressed before). Only stopping the container reaches the reliable floor,
+so stop/start is the chosen mechanism. Sleep mode was tested for the record; it
+is **not** wired into either stack.
+
+**Measured (A10, this session):**
+
+| condition | power | memory | p-state |
+|---|---|---|---|
+| served / loaded-idle (both stacks) | ~58 W | ~22 GiB | P0 |
+| idle 15 min → backend stopped | **~15 W** | **0 MiB** | P8 |
+
+The `0 MiB` reading proves the CUDA context is torn down, not merely asleep.
+After a stop the card re-downshifts P0→P8 within ~30 s, then settles to ~15 W.
+
+| latency | 27B Dense | 35B MoE |
+|---|---|---|
+| first-ever cold load | 129 s | 168 s |
+| wake after idle (OS caches warm) | 32 s | 53 s |
+| `WAKE_TIMEOUT_SECONDS` budget | 240 s | 300 s |
+
+**Topology.** The `vllm` service publishes **no host port**; LiteLLM reaches it
+over the compose network at `http://vllm:8000`. LiteLLM binds
+`0.0.0.0:4000:4000` (LAN-accessible — see *Security*). open-webui points at
+`http://litellm:4000/v1`. Local clients, `make bench`, and `bin/claude-qwen` hit
+`http://localhost:4000`; remote hosts hit the box's LAN IP (override
+`ANTHROPIC_BASE_URL` / `OPENAI_API_BASE_URL`).
+
+### Endpoints
+
+Base URL `http://<host>:4000` — `<host>` is `localhost` on the box, its LAN IP
+from a remote host. Auth is **disabled** on all of these (no `master_key`); the LAN
+is the trust boundary (see *Security*).
+
+| Method & path | Wakes GPU? | Use |
+|---|---|---|
+| `POST /v1/messages` | **yes** | Anthropic Messages API — `bin/claude-qwen` / Claude Code |
+| `POST /v1/chat/completions` | **yes** | OpenAI Chat — open-webui, `make bench` |
+| `POST /v1/completions` | **yes** | OpenAI legacy completions |
+| `GET /v1/models` | no (cold) | lists the three aliases; safe for pollers (open-webui, gateway discovery) |
+| `GET /health/liveliness` | no | process-alive probe (`200 "I'm alive!"`, `503` while draining) |
+| `GET /health/readiness` | no | config + DB validity; safe for load balancers |
+| `GET /metrics` | no | LiteLLM's own Prometheus metrics (proxy-side; not vLLM's `/metrics`) |
+
+The completion routes flow through the `async_pre_call_hook`, which wakes the
+backend before the first byte. The cold routes are served from config / process
+state and never touch the GPU — that is why open-webui's model-list polling and
+Claude Code's gateway discovery cannot pin the card awake. The deep `GET /health`
+(not in the table) pings the backend directly, so it reports **unhealthy while vLLM
+is idle-stopped**; it carries no chat traffic and will not revive a stopped backend
+on its own — use `/health/liveliness` for an alive probe.
+
+**Wake is inference-triggered.** LiteLLM's `async_pre_call_hook` runs `ensure_up()`
+before every completion (coalesced behind a lock, so a burst wakes once). It fires
+only on real LLM calls — LiteLLM's own `/v1/models` and `/health` are served cold
+from config, so background pollers (open-webui's model-list polling, Claude Code's
+gateway discovery) cannot pin the GPU awake. While the backend is down,
+`/v1/models` still lists all three aliases and wake fires on the first message.
+
+**Idle detection.** A background task (started via
+`LITELLM_WORKER_STARTUP_HOOKS=litellm_callbacks.start_background_tasks`) polls
+`http://vllm:8000/metrics` (at the **root**, not `/v1`) every `POLL_SECONDS` and
+parses `vllm:num_requests_running`, `_waiting`, `_swapped`. Idle = all three
+`== 0` sustained `IDLE_SECONDS` (one busy poll resets the timer).
+`num_requests_swapped` is absent in vLLM v1 and is treated as 0. On idle →
+`POST /containers/{name}/stop` over the docker socket. At startup a `bootstrap()`
+task waits for the warm-started backend's `/health` and arms the timer — without
+it, a freshly-started-but-unused stack would never idle-stop. Container control
+talks to the Engine API over `/var/run/docker.sock` via `httpx` (the litellm image
+ships no docker SDK).
+
+### Thinking — three aliases, one backend
+
+`preserve_thinking` and `enable_thinking` are **per-request** Qwen3.6 Jinja flags
+(verified in `QuantTrio/Qwen3.6-*/chat_template.jinja` — the 27B and MoE
+templates are byte-identical). One running vLLM serves all combos; LiteLLM sends
+the right `chat_template_kwargs` per alias:
+
+| LiteLLM alias | `preserve_thinking` | `enable_thinking` | use |
+|---|---|---|---|
+| `claude-sonnet` | false | true (default) | **DEFAULT** — thinking shown this turn, not carried |
+| `claude-sonnet-preserve` | true | true (default) | **RARE** — carry prior `<think>` across turns |
+| `claude-haiku` | false | false | **BACKGROUND** — no reasoning pass (titles/summaries) |
+
+The template always keeps the **most-recent** turn's reasoning; `preserve_thinking`
+additionally keeps *older* turns. With `--reasoning-parser qwen3`, vLLM emits
+`reasoning_content` and LiteLLM's `/v1/messages` adapter is expected to render it
+as native Anthropic `{type:thinking}` blocks (the collapsible thinking UI).
+
+> **Caveat (verify-gated).** `claude-sonnet-preserve` only re-renders prior
+> reasoning that is **actually present** in the incoming messages. Claude Code /
+> LiteLLM may strip prior assistant thinking from history, or name the field
+> `reasoning` where the template reads `reasoning_content`. So `claude-sonnet`
+> works fully today; `claude-sonnet-preserve` is a **no-op until reasoning
+> survives the round trip**. Closing it is a documented hook point in
+> `litellm_callbacks.async_pre_call_hook` (re-inject `reasoning_content` on prior
+> assistant messages, idempotent) — wire it only if a bench shows it's needed.
+
+### Drive it with Claude Code
+
+```bash
+./bin/claude-qwen           # sets ANTHROPIC_* env and execs `claude`
+```
+
+`claude-qwen` points Claude Code at the proxy
+(`ANTHROPIC_BASE_URL=http://localhost:4000` by default, no `/v1`; override it to
+the box's LAN IP — e.g. `ANTHROPIC_BASE_URL=http://10.0.0.5:4000 ./bin/claude-qwen`
+— to drive from a remote host), sends a placeholder `ANTHROPIC_AUTH_TOKEN` (the
+proxy is auth-free; Claude Code just needs one non-empty), defaults the model to
+`claude-sonnet` and the background model to `claude-haiku`, and enables gateway
+model discovery so `/model` lists all three aliases. Switch mid-session:
+`/model claude-sonnet-preserve`. The host needs the `claude` CLI on `PATH`.
+
+### Tuning, controls, security
+
+| env (on the `litellm` service) | default | meaning |
+|---|---|---|
+| `VLLM_IDLE_SECONDS` | 900 | sustained idle before stop |
+| `VLLM_POLL_SECONDS` | 10 | `/metrics` poll interval |
+| `VLLM_WAKE_TIMEOUT` | 240 (27B) / 300 (MoE) | cold-start health-wait budget |
+
+`make litellm-logs` / `make litellm-logs35` tail the proxy (wake/stop events log
+here). `docker stop` is deliberate, so vLLM's `restart: "no"` keeps it down until
+the next inference request; LiteLLM itself is `restart: unless-stopped`.
+
+**Security — deliberate exposure.** LiteLLM is bound `0.0.0.0:4000` (reachable
+from the LAN, by design) and auth is **disabled** (no `master_key`: open-webui,
+the bench, and remote Claude Code hosts need no API key). The service also mounts
+`/var/run/docker.sock` read-write (start/stop needs write, which is root-equivalent
+host control). Net effect: **any host that can reach `:4000` can start/stop
+arbitrary containers on this box** — treat the network as trusted. To put a key in
+front later, set `master_key` in `litellm_config.yaml` and point clients'
+`ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY` at it; that gates the API, not the socket,
+so also tighten to `127.0.0.1:4000` once you stop needing remote access.
+
+**Surface & revert.** All state is in-repo (no systemd, cron, or
+`nvidia-smi -pm 1`). Reverting the tracked files to HEAD restores the direct-vLLM
+topology — vLLM on host `:8000`, `open-webui` → `http://vllm:8000/v1`, no proxy and
+no idle management; delete the three new files to finish:
+`make stop && git checkout docker-compose.yaml docker-compose.moe.yaml Makefile
+README.md scripts/coding_session_bench.py && rm -f litellm_config.yaml
+litellm_callbacks.py bin/claude-qwen` (then restart). The retired `sidecar/` gate
+(predecessor of `litellm_callbacks.py`) lives on disk but was never committed — its
+logic was ported into `litellm_callbacks.py`.
+
+---
+
 ## Prefix caching
 
 vLLM supports prefix caching for these hybrid models **experimentally**.
@@ -571,10 +747,14 @@ block size set by the mamba page alignment:
   than ollama's small-segment cache, which is why tiny prompts hit on ollama but
   not here. For real chat (system prompt + history >> block size) it
   matches/beats ollama.
-- **Measure via `/metrics` at the root** (`http://host:8000/metrics`), not
-  `/v1/metrics`. Counters: `vllm:prefix_cache_queries_total`,
-  `vllm:prefix_cache_hits_total` (cumulative token counts). v0.24.0 returns
-  `usage.prompt_tokens_details: null`, so usage can't be used for hit rate.
+- **Measure via `/metrics` at the root**, not `/v1/metrics`. vLLM is internal-only
+  now (no host port), so reach it through compose:
+  `docker compose exec vllm curl -s localhost:8000/metrics` (or `-f
+  docker-compose.moe.yaml exec vllm ...` for the MoE). Counters:
+  `vllm:prefix_cache_queries_total`, `vllm:prefix_cache_hits_total` (cumulative
+  token counts). v0.24.0 returns `usage.prompt_tokens_details: null`, so usage
+  can't be used for hit rate. (`make bench` can't read these through the LiteLLM
+  proxy, so its `hit%` column reads 0 — TPS/TTFT are still valid.)
 
 ### The reported `hit_rate` lags the real per-turn hit
 
@@ -863,8 +1043,8 @@ param-bound). Do not retry without reason.
 - **open-webui persisted base URL**: `OPENAI_API_BASE_URL` env only seeds a fresh
   DB. The `open-webui-data` volume persists `openai.api_base_urls` in sqlite
   `config`, which takes precedence → empty model dropdown if it still points at
-  an old backend. Fix: update that DB row to `http://vllm:8000/v1` and restart,
-  or wipe the volume.
+  an old backend. Fix: update that DB row to `http://litellm:4000/v1` and restart,
+  or wipe the volume. (Pre-LiteLLM it was `http://vllm:8000/v1`.)
 - **Thinking mode**: the model is a thinking model. Without `--reasoning-parser
   qwen3`, thinking tags are stripped (special tokens) and raw CoT dumps into
   `content`, eating `max_tokens` → truncated answer. The parser moves thinking

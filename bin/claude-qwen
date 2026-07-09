@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Wrap the `claude` CLI to drive local Qwen3.6 (via the LiteLLM sole proxy) as if
+# it were Anthropic. All knobs are env-only; this just sets them and execs `claude`.
+#
+# The proxy runs auth-free and is bound 0.0.0.0:4000 (LAN-accessible), so the token
+# below is a placeholder -- Claude Code merely requires ANTHROPIC_AUTH_TOKEN to be
+# non-empty. Override ANTHROPIC_BASE_URL to the box's LAN IP for a remote host.
+# Override the token if you re-enable LiteLLM auth and need a real Bearer key.
+set -euo pipefail
+
+export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-http://localhost:4000}"      # NO /v1
+export ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-sk-claude-qwen-local}"   # placeholder
+export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet}"                    # default = strip
+export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-claude-haiku}"  # bg: no reasoning
+
+# Let the /model picker list all three aliases; cut telemetry noise.
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+# Auth-token path is mutually exclusive with the raw API key / cloud gateways.
+unset ANTHROPIC_API_KEY CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
+
+exec claude "$@"

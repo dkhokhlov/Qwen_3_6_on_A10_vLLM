@@ -1,2 +1,5 @@
 .opencode
 *.pic
+.env
+__pycache__/
+*.pyc

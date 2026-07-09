@@ -4,7 +4,7 @@ PY      ?= python3
 BENCH   ?= scripts/coding_session_bench.py
 TURNS   ?= 27  # reaches ~64k seq (full context): ~2k input + ~500 output/turn
 
-.PHONY: help run start stop run35 start35 stop35 bench bench35 bench_pcie
+.PHONY: help run start stop run35 start35 stop35 bench bench35 bench_pcie idle-test litellm-logs litellm-logs35
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -30,8 +30,22 @@ stop35: ## Stop the 35B MoE stack (containers kept, not removed)
 bench: ## Run the growing coding-session bench (override with TURNS=N)
 	$(PY) $(BENCH) --turns $(TURNS)
 
-bench35: ## Bench the 35B MoE on vllm-qwen35b (override with TURNS=N)
-	$(PY) $(BENCH) --model qwen3.6-35b-a3b --turns $(TURNS)
+bench35: ## Bench the 35B MoE stack via the LiteLLM claude-haiku alias (override with TURNS=N)
+	$(PY) $(BENCH) --model claude-haiku --turns $(TURNS)
 
 bench_pcie: ## Measure GPU<->host PCIe bandwidth (free GPU needed: `make stop` first)
 	$(PY) scripts/pcie_bw_bench.py
+
+idle-test: ## (read-only) measure idle/stop/cold-wake power — see PLAN Phase 0
+	@echo "Phase 0 power test (read-only; expect ~15W stopped vs ~50-75W served):"
+	@echo "  0. make stop && make stop35   (clean GPU)"
+	@echo "  1. served idle : make start; wait /health 200 + 120s settle"
+	@echo "  2. stop floor  : make stop; wait 120s"
+	@echo "  3. cold wake   : time make start; poll curl http://localhost:4000/health until 200"
+	@echo "  power sampler : nvidia-smi -q -d POWER | grep -E 'Instantaneous|Average'"
+
+litellm-logs: ## Tail the LiteLLM proxy (27B stack: translate + wake/idle lifecycle)
+	docker compose logs -f litellm
+
+litellm-logs35: ## Tail the LiteLLM proxy (35B MoE stack)
+	docker compose -f docker-compose.moe.yaml logs -f litellm
