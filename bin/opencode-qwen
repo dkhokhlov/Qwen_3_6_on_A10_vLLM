@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Wrap the `opencode` CLI to drive local Qwen3.6 (via the LiteLLM sole proxy).
+#
+# opencode cannot be pointed at a custom endpoint by env alone: it ignores
+# OPENAI_BASE_URL for its built-in `openai` provider. So we hand it a dedicated
+# openai-compatible provider via a PRIVATE XDG_CONFIG_HOME -- a COPY of
+# opencode-qwen.json from this repo. That keeps this session fully isolated from
+# your global ~/.config/opencode/opencode.json (the Kimi/cloud default): no leak
+# to a cloud gateway, and no change to plain `opencode` behaviour. (A copy, not a
+# symlink, so any write-back opencode does lands on the disposable copy, not the
+# committed file.)
+#
+# The proxy is auth-free (bound 0.0.0.0:4000), so apiKey below is a placeholder.
+# The three aliases match litellm_config.yaml; -m litellm/claude-sonnet is the
+# strip-thinking default. Switch alias mid-session with /model:
+#   litellm/claude-sonnet           DEFAULT -- thinking shown this turn, not carried
+#   litellm/claude-sonnet-preserve  carry prior <think> across turns
+#   litellm/claude-haiku            no-reasoning background model (small_model)
+#
+# First run may pull the @ai-sdk/openai-compatible npm provider (one-time).
+set -euo pipefail
+
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+CONF="$REPO/opencode-qwen.json"
+
+# Private config home so opencode reads OUR provider, not the global Kimi one.
+HOME_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/opencode-qwen"
+mkdir -p "$HOME_DIR/opencode"
+cp -f "$CONF" "$HOME_DIR/opencode/opencode.json"
+export XDG_CONFIG_HOME="$HOME_DIR"
+
+# Force the model so a stray cloud alias can't win.
+MODEL="${OPENCODE_QWEN_MODEL:-litellm/claude-sonnet}"
+exec opencode -m "$MODEL" "$@"
