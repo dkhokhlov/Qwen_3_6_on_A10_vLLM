@@ -1,0 +1,48 @@
+# LiteLLM sole-proxy config for Qwen3.6 on the A10 (shared by both stacks).
+#
+# Three aliases against ONE vLLM instance. They differ ONLY in
+# extra_body.chat_template_kwargs, which LiteLLM passes through to vLLM and the
+# Qwen3.6 chat_template reads per request (verified in
+# QuantTrio/Qwen3.6-*/chat_template.jinja):
+#   - enable_thinking   whether THIS generation reasons (default ON; leave it)
+#   - preserve_thinking whether PRIOR turns' reasoning stays in context (default OFF)
+#
+# So one running backend serves all three combos interleaved; Claude Code picks one
+# via /model. The backend identity (model + api_base) comes from the environment so
+# the same file serves the 27B dense and 35B MoE stacks.
+#
+#   claude-sonnet           DEFAULT  strip -- thinking shown this turn, not carried
+#   claude-sonnet-preserve  RARE     keep  -- carry prior <think> across turns
+#   claude-haiku            BACKGROUND no reasoning pass (titles/summaries)
+
+model_list:
+  - model_name: claude-sonnet
+    litellm_params:
+      model: os.environ/LITELLM_VLLM_MODEL
+      api_base: os.environ/LITELLM_VLLM_API_BASE
+      api_key: dummy
+      extra_body:
+        chat_template_kwargs: { preserve_thinking: false }
+  - model_name: claude-sonnet-preserve
+    litellm_params:
+      model: os.environ/LITELLM_VLLM_MODEL
+      api_base: os.environ/LITELLM_VLLM_API_BASE
+      api_key: dummy
+      extra_body:
+        chat_template_kwargs: { preserve_thinking: true }
+  - model_name: claude-haiku
+    litellm_params:
+      model: os.environ/LITELLM_VLLM_MODEL
+      api_base: os.environ/LITELLM_VLLM_API_BASE
+      api_key: dummy
+      extra_body:
+        chat_template_kwargs: { enable_thinking: false, preserve_thinking: false }
+
+litellm_settings:
+  callbacks: litellm_callbacks.handler   # wake-on-request + idle-stop, ported from sidecar/app.py
+  # No master_key -> auth is OFF and :4000 is bound 0.0.0.0, so any network host
+  # can call the proxy (operator's explicit choice; see README Security).
+  # open-webui and the bench need no API key; Claude Code sends a placeholder token.
+  drop_params: true                       # drop Claude Code params vLLM rejects -> no 400s
+  request_timeout: 600                    # generous; cold wake happens in the pre-call hook
+  num_workers: 1                          # one idle-watcher, one wake-lock owner

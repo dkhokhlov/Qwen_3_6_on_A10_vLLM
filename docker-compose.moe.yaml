@@ -4,8 +4,6 @@ services:
     container_name: vllm-qwen35b
     gpus: all
     shm_size: 32g
-    ports:
-      - "8000:8000"
     environment:
       HF_TOKEN: ${HF_TOKEN}
       HF_HOME: /root/.cache/huggingface
@@ -36,7 +34,38 @@ services:
       --tool-call-parser hermes
       --reasoning-parser qwen3
       --trust-remote-code
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:8000/health\").status==200 else 1)'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 240s
     restart: "no"
+
+  # LiteLLM sole proxy: Anthropic<->OpenAI translation + three thinking aliases,
+  # and owns the vllm lifecycle (wake-on-request, idle-stop). See
+  # litellm_config.yaml + litellm_callbacks.py (ported from sidecar/app.py).
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: vllm-litellm35b
+    ports:
+      - "0.0.0.0:4000:4000"   # LAN-accessible: remote hosts drive the proxy (see README Security)
+    environment:
+      LITELLM_VLLM_MODEL: hosted_vllm/qwen3.6-35b-a3b
+      LITELLM_VLLM_API_BASE: http://vllm:8000/v1
+      BACKEND_CONTAINER: vllm-qwen35b
+      BACKEND_URL: http://vllm:8000
+      IDLE_SECONDS: "${VLLM_IDLE_SECONDS:-900}"
+      POLL_SECONDS: "${VLLM_POLL_SECONDS:-10}"
+      WAKE_TIMEOUT_SECONDS: "${VLLM_WAKE_TIMEOUT:-300}"
+      LITELLM_WORKER_STARTUP_HOOKS: litellm_callbacks.start_background_tasks
+      PYTHONPATH: /app
+    volumes:
+      - ./litellm_config.yaml:/app/litellm_config.yaml:ro
+      - ./litellm_callbacks.py:/app/litellm_callbacks.py:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --config /app/litellm_config.yaml --port 4000 --num_workers 1
+    restart: unless-stopped   # always-on proxy self-heals (only vllm is restart:"no")
 
 volumes:
   vllm_cache_moe:

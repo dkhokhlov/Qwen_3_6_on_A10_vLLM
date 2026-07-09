@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simulate a growing coding chat session against a vLLM OpenAI endpoint and
+"""Simulate a growing coding chat session against the LiteLLM proxy endpoint and
 measure per-turn prefill TPS and output TPS.
 
 Each turn appends a ~2k-token user message and requests ~500 completion tokens.
@@ -110,8 +110,12 @@ def stream_turn(base_url, model, messages, max_tokens, timeout):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-url", default="http://localhost:8000/v1")
-    ap.add_argument("--model", default="qwen3.6-27b")
+    # Through the LiteLLM sole proxy (vLLM is internal-only); claude-haiku is the
+    # no-reasoning alias, so decode/prefill TPS are measured without thinking tokens.
+    # Cache counters are read from /metrics; vLLM's /metrics is not proxied by LiteLLM,
+    # so when base-url is the proxy they come back absent -> hit% reads 0 (TPS still valid).
+    ap.add_argument("--base-url", default="http://localhost:4000/v1")
+    ap.add_argument("--model", default="claude-haiku")
     ap.add_argument("--turns", type=int, default=8)
     ap.add_argument("--input-tokens", type=int, default=2000,
                     help="target size of each new user message (approx)")
