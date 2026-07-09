@@ -24,16 +24,28 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 ## TOC
 
 **Part 1 — Getting Started**
-- [Quick Start](#quick-start) · [Repo structure](#repo-structure) · [Security](#security)
+- [Quick Start](#quick-start)
+- [Repo structure](#repo-structure)
+- [Security](#security)
 
 **Part 2 — Single-A10 Deployments**
-- [TL;DR — one A10, both models](#tldr--one-a10-both-models) · [Hardware](#hardware) · [Dense vs MoE — why the bigger model serves more context](#dense-vs-moe--why-the-bigger-model-serves-more-context) · [AWQ quantization](#awq-quantization--the-method-and-why-both-models-use-it) · [Deployment A — 27B Dense](#deployment-a--qwen36-27b-awq-dense) · [Deployment B — 35B MoE](#deployment-b--qwen36-35b-a3b-awq-moe) · [Idle power-down — the LiteLLM sole proxy](#idle-power-down--the-litellm-sole-proxy)
+- [TL;DR — one A10, both models](#tldr--one-a10-both-models)
+- [Hardware](#hardware)
+- [Dense vs MoE — why the bigger model serves more context](#dense-vs-moe--why-the-bigger-model-serves-more-context)
+- [AWQ quantization](#awq-quantization--the-method-and-why-both-models-use-it)
+- [Deployment A — 27B Dense](#deployment-a--qwen36-27b-awq-dense)
+- [Deployment B — 35B MoE](#deployment-b--qwen36-35b-a3b-awq-moe)
+- [Idle power-down — the LiteLLM sole proxy](#idle-power-down--the-litellm-sole-proxy)
 
 **Part 3 — Measurements & Operations**
-- [Prefix caching](#prefix-caching) · [Experiments that did NOT work](#experiments-that-did-not-work-do-not-retry-without-reason) · [Hardware ceiling facts](#hardware-ceiling-facts) · [Gotchas](#gotchas)
+- [Prefix caching](#prefix-caching)
+- [Experiments that did NOT work](#experiments-that-did-not-work-do-not-retry-without-reason)
+- [Hardware ceiling facts](#hardware-ceiling-facts)
+- [Gotchas](#gotchas)
 
 **Part 4 — Scaling Beyond One A10**
-- [PCIe bandwidth](#pcie-bandwidth--grounding-the-tp2-on-x4-question) · [Two A10 cards — TP=2 projections](#two-a10-cards--tp2-projections-for-dense-and-moe)
+- [PCIe bandwidth](#pcie-bandwidth--grounding-the-tp2-on-x4-question)
+- [Two A10 cards — TP=2 projections](#two-a10-cards--tp2-projections-for-dense-and-moe)
 
 ## Part 1 — Getting Started
 
