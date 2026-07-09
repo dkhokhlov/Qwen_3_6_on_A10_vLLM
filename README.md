@@ -23,23 +23,21 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 
 ## TOC
 
-- [Quick Start](#quick-start)
-- [Repo structure](#repo-structure)
-- [TL;DR — one A10, both models](#tldr--one-a10-both-models)
-- [Dense vs MoE — why the bigger model serves more context](#dense-vs-moe--why-the-bigger-model-serves-more-context)
-- [Hardware](#hardware)
-- [AWQ quantization — the method, and why both models use it](#awq-quantization--the-method-and-why-both-models-use-it)
-- [Deployment A — Qwen3.6-27B-AWQ (Dense)](#deployment-a--qwen36-27b-awq-dense)
-- [Deployment B — Qwen3.6-35B-A3B-AWQ (MoE)](#deployment-b--qwen36-35b-a3b-awq-moe)
-- [Idle power-down — the LiteLLM sole proxy](#idle-power-down--the-litellm-sole-proxy)
-- [Prefix caching](#prefix-caching)
-- [PCIe bandwidth — grounding the TP=2-on-x4 question](#pcie-bandwidth--grounding-the-tp2-on-x4-question)
-- [Two A10 cards — TP=2 projections for Dense and MoE](#two-a10-cards--tp2-projections-for-dense-and-moe)
-- [Experiments that did NOT work (do not retry without reason)](#experiments-that-did-not-work-do-not-retry-without-reason)
-- [Hardware ceiling facts](#hardware-ceiling-facts)
-- [Gotchas](#gotchas)
+**Part 1 — Getting Started**
+- [Quick Start](#quick-start) · [Repo structure](#repo-structure) · [Security](#security)
 
-## Quick Start
+**Part 2 — Single-A10 Deployments**
+- [TL;DR — one A10, both models](#tldr--one-a10-both-models) · [Hardware](#hardware) · [Dense vs MoE — why the bigger model serves more context](#dense-vs-moe--why-the-bigger-model-serves-more-context) · [AWQ quantization](#awq-quantization--the-method-and-why-both-models-use-it) · [Deployment A — 27B Dense](#deployment-a--qwen36-27b-awq-dense) · [Deployment B — 35B MoE](#deployment-b--qwen36-35b-a3b-awq-moe) · [Idle power-down — the LiteLLM sole proxy](#idle-power-down--the-litellm-sole-proxy)
+
+**Part 3 — Measurements & Operations**
+- [Prefix caching](#prefix-caching) · [Experiments that did NOT work](#experiments-that-did-not-work-do-not-retry-without-reason) · [Hardware ceiling facts](#hardware-ceiling-facts) · [Gotchas](#gotchas)
+
+**Part 4 — Scaling Beyond One A10**
+- [PCIe bandwidth](#pcie-bandwidth--grounding-the-tp2-on-x4-question) · [Two A10 cards — TP=2 projections](#two-a10-cards--tp2-projections-for-dense-and-moe)
+
+## Part 1 — Getting Started
+
+### Quick Start
 
 | target | what |
 |---|---|
@@ -59,11 +57,12 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 The two stacks share host port `4000` (the LiteLLM proxy) and the one GPU, so stop
 one before starting the other.
 
-- LiteLLM proxy (host-facing, localhost): `http://localhost:4000`
+- LiteLLM proxy (host-facing): `http://localhost:4000` (or the box's LAN IP)
   - Anthropic `/v1/messages` **and** OpenAI `/v1/*` — same base
-  - aliases: `claude-sonnet` (default), `claude-sonnet-preserve`, `claude-haiku`
-  - backend served-model-names (internal only): `qwen3.6-27b` / `qwen3.6-35b-a3b`
-- Claude Code: `./bin/claude-qwen` (sets `ANTHROPIC_*` env, execs `claude`; see *Idle power-down*)
+  - three model names per stack: `<base>` (default), `<base>-preserve`, `<base>-nothink`
+    — `<base>` is `qwen3.6-27b` (dense) / `qwen3.6-35b-a3b` (MoE)
+- Claude Code: `./bin/claude-qwen` / `./bin/claude-qwen-moe` (see *Drive it with Claude Code*)
+- opencode: `./bin/opencode-qwen` / `./bin/opencode-qwen-moe` (see *Drive it with opencode*)
 - open-webui: `http://localhost:3000/`
 
 The coding-session bench (`scripts/coding_session_bench.py`) streams a chat that
@@ -72,22 +71,31 @@ reports per-turn prompt/seq/cached/uncached tokens, TTFT, prefill TPS, output
 TPS, and prefix-cache hit %. Cache hit is read from vLLM `/metrics` (at the
 **root**, not `/v1`).
 
-## Repo structure
+### Repo structure
 
 | file | what |
 |---|---|
 | `docker-compose.yaml` | vLLM (27B Dense) + LiteLLM sole proxy + open-webui stack |
 | `docker-compose.moe.yaml` | vLLM (35B MoE, 128k, 2.2 GiB offload) + LiteLLM stack |
-| `litellm_config.yaml` | LiteLLM config: three thinking aliases, one shared backend (env-driven) |
-| `litellm_callbacks.py` | custom callback: wake-on-request + idle-stop (ported from `sidecar/app.py`) |
-| `bin/claude-qwen` | Claude Code wrapper: sets `ANTHROPIC_*` env, execs `claude` against the proxy |
+| `litellm_config.yaml` / `.moe.yaml` | LiteLLM config per stack: three model names, one shared backend (env-driven) |
+| `litellm_callbacks.py` | custom callback: wake-on-request + idle-stop |
+| `bin/claude-qwen` / `-moe` | Claude Code wrappers: set `ANTHROPIC_*` env, exec `claude` against the proxy |
+| `bin/opencode-qwen` / `-moe` | opencode wrappers: private `XDG_CONFIG_HOME` pointing at our provider |
+| `opencode-qwen.json` / `-moe.json` | opencode provider config the wrappers copy from (baseURL, model limits) |
 | `Makefile` | `run` / `start` / `stop` / `run35` / `start35` / `stop35` / `bench` / `bench35` / `bench_pcie` / `idle-test` / `litellm-logs` / `litellm-logs35` |
-| `scripts/coding_session_bench.py` | growing coding-session bench via the LiteLLM proxy (prefill/output tps; cache hit internal-only now) |
+| `scripts/coding_session_bench.py` | growing coding-session bench via the proxy (prefill/output tps; cache hit via `/metrics`) |
 | `scripts/pcie_bw_bench.py` | GPU↔host PCIe D2H/H2D bandwidth + TP=2 all-reduce estimate |
-| `sidecar/` | retired idle gate (predecessor of `litellm_callbacks.py`); kept for reference/revert |
-| `README.md` | this doc |
 
-## TL;DR — one A10, both models
+### Security
+
+The proxy binds `0.0.0.0:4000` (LAN-reachable) with auth **disabled** and mounts
+`/var/run/docker.sock` read-write (root-equivalent host control). Treat any host
+that can reach `:4000` as trusted — this is deliberate; see
+[Tuning & security](#tuning--security) for the full exposure and how to lock it down.
+
+## Part 2 — Single-A10 Deployments
+
+### TL;DR — one A10, both models
 
 | | Qwen3.6-27B-AWQ (**Dense**) | Qwen3.6-35B-A3B-AWQ (**MoE**) |
 |---|---|---|
@@ -111,7 +119,7 @@ TPS, and prefix-cache hit %. Cache hit is read from vLLM `/metrics` (at the
 | compose file | `docker-compose.yaml` | `docker-compose.moe.yaml` |
 | bench target | `make bench` | `make bench35` |
 
-## Dense vs MoE — why the bigger model serves more context
+### Dense vs MoE — why the bigger model serves more context
 
 **The 35B model serves 128k context while the 27B only serves 64k — despite
 the 35B having more weights.** Three facts invert the "bigger model = less
@@ -140,7 +148,7 @@ the freed GPU holds ~150k tokens of KV+state → 128k context with margin.
 (120/150 W). See [Offload efficiency cost](#offload-efficiency-cost). The dense
 27B pays none of this.
 
-### MoE no-offload math (why offload is required, not optional)
+#### MoE no-offload math (why offload is required, not optional)
 
 Budget at util 0.97 = 0.97 × 22.06 = 21.40 GiB. Post-repack weights ≈ 21.38 GiB.
 From the 1 GiB offload run: GPU weights 20.31, KV 0.65 → vLLM's non-KV reserve
@@ -156,7 +164,7 @@ So GPU-only is param+reserve-bound by ~0.2 GiB at the achievable util; offload
 is required for any usable context. (The offload is a *serving-time* offload —
 it persists into serving, not load-only — but the penalty is ~15 tps, not 2 tps.)
 
-## Hardware
+### Hardware
 
 | | |
 |---|---|
@@ -171,7 +179,7 @@ it persists into serving, not load-only — but the penalty is ~15 tps, not 2 tp
 A second A10 on the same host would lift both ceilings and remove the MoE
 offload tax — see [Two A10 cards — TP=2 projections](#two-a10-cards--tp2-projections-for-dense-and-moe).
 
-## AWQ quantization — the method, and why both models use it
+### AWQ quantization — the method, and why both models use it
 
 Both Qwen3.6 checkpoints served here are **AWQ-INT4** (verified in each
 `config.json`: `quant_method: awq`, `bits: 4`, `group_size: 128`, asymmetric
@@ -179,7 +187,7 @@ zero-points) running on vLLM's **Marlin** kernel. This is the single biggest
 reason a 27B and a 35B model both fit on 24GB at near-FP16 quality — and it is
 strictly better than naive (static) INT4.
 
-### The loss problem: INT4 is coarse, and round-to-nearest wastes the budget
+#### The loss problem: INT4 is coarse, and round-to-nearest wastes the budget
 
 INT4 gives each weight one of **16 levels**. Rounding a continuous FP16 weight
 into 16 buckets is inherently lossy, so the question is *where* you accept the
@@ -190,7 +198,7 @@ channels just as coarsely as the rest, so the error lands exactly where it hurts
 most. At INT4, RTN alone collapses accuracy; staying usable usually means keeping
 so many layers in FP16 that you lose most of the memory win.
 
-### AWQ's idea: protect the salient channels with a cheap per-channel scale
+#### AWQ's idea: protect the salient channels with a cheap per-channel scale
 
 AWQ (Activation-aware Weight Quantization, Lin et al. 2023) finds the salient
 channels from the **activations** that run through them — measured on a small
@@ -202,7 +210,7 @@ rounding error is pushed onto the unimportant channels, where it is harmless.
 The whole tensor stays INT4; only a small per-group scale + zero-point is added
 (here, group size 128).
 
-### How the checkpoint is produced
+#### How the checkpoint is produced
 
 1. **Calibrate** — run a few hundred representative prompts through the FP16
    model; record per-channel activation magnitudes.
@@ -218,7 +226,7 @@ Net: AWQ-INT4 typically stays within **<1 perplexity point** and **<1 %** on
 standard benchmarks of the FP16 original — at 4 bits/weight. RTN at the same
 width is far worse.
 
-### The repack: AWQ checkpoint → Marlin (W4A16) for vLLM
+#### The repack: AWQ checkpoint → Marlin (W4A16) for vLLM
 
 The AWQ checkpoint on disk is in AWQ's own layout (group scales/zero-points
 interleaved with the packed weights). vLLM's fast serving path is the **Marlin
@@ -236,7 +244,7 @@ The payoff: weights stay INT4-packed in GDDR6 through all of serving. For the
 bandwidth (~3–4× faster decode). Without AWQ-Marlin neither model fits; with it,
 both decode flat to max context.
 
-### Both models, one recipe
+#### Both models, one recipe
 
 | | Dense 27B | MoE 35B-A3B |
 |---|---|---|
@@ -251,14 +259,14 @@ repack's transient scratch, which is what makes offload mandatory for the 35B
 64k, MoE ~15.4 tps at 128k — precisely because AWQ-Marlin keeps their weights
 small enough to leave room for KV.
 
-## Deployment A — Qwen3.6-27B-AWQ (Dense)
+### Deployment A — Qwen3.6-27B-AWQ (Dense)
 
-### Why it fits on 24GB: AWQ + hybrid linear attention + tuned caches
+#### Why it fits on 24GB: AWQ + hybrid linear attention + tuned caches
 
 Three things together make 64k context on a 24GB GPU possible — and keep decode
 fast at long context.
 
-#### 1. AWQ INT4 weights on the fast Marlin kernel
+##### 1. AWQ INT4 weights on the fast Marlin kernel
 
 `QuantTrio/Qwen3.6-27B-AWQ` is genuinely packed INT4 (not just a name), and vLLM
 runs it on **AWQ-Marlin** (fused dequant + INT4 GEMM) — *not* dequantized to FP16.
@@ -282,7 +290,7 @@ If vLLM dequantized to FP16 the footprint would be ~54 GiB — wouldn't fit, and
 decode would be ~3–4× slower. Marlin keeps INT4 packed in GDDR6 and dequants inside
 the GEMM, so you get the full memory/bandwidth benefit.
 
-#### 2. Hybrid architecture — 48 of 64 layers are linear (GatedDeltaNet)
+##### 2. Hybrid architecture — 48 of 64 layers are linear (GatedDeltaNet)
 
 This is **why output tps stays flat as context grows.** Only 16 layers are
 full-attention (KV-cached, `O(context)` per token); 48 are linear-attention with
@@ -321,7 +329,7 @@ are `O(1)`. Prefill of the new turn slows ~49 % because the 16 full-attention
 layers attend over the entire cached prefix per prefilled token. See
 [Verified performance (27B)](#verified-performance-27b).
 
-#### 3. KV + state caches tuned for the hybrid mix
+##### 3. KV + state caches tuned for the hybrid mix
 
 | cache | dtype | covers | why |
 |---|---|---|---|
@@ -332,7 +340,7 @@ layers attend over the entire cached prefix per prefilled token. See
 Without the `--mamba-ssm-cache-dtype float16` lever, 64k context would not fit
 on this GPU. See [Working config (27B)](#working-config-27b).
 
-### Working config (27B)
+#### Working config (27B)
 
 `docker-compose.yaml` vLLM command — bulleted:
 
@@ -350,7 +358,7 @@ on this GPU. See [Working config (27B)](#working-config-27b).
 - `--enforce-eager`
 - `--enable-prefix-caching`
 - `--enable-auto-tool-choice`
-- `--tool-call-parser hermes`
+- `--tool-call-parser qwen3_xml`
 - `--reasoning-parser qwen3`
 - `--trust-remote-code`
 
@@ -369,14 +377,14 @@ Flag rationale (non-obvious ones):
 | `--enforce-eager` | — | no CUDA graph capture; saves memory (see Experiments) |
 | `--enable-prefix-caching` | — | experimental hybrid support; align mode, 800-token block |
 | `--reasoning-parser` | qwen3 | thinking → `message.reasoning`, not eating `max_tokens` |
-| `--tool-call-parser` | hermes | tool-call parsing |
+| `--tool-call-parser` | qwen3_xml | Qwen3.6 native XML tool calls |
 | `--trust-remote-code` | — | hybrid arch needs it |
 
 Env: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `HF_HUB_OFFLINE=1`,
 `TRANSFORMERS_OFFLINE=1`. HF cache mounted read-only; `HF_TOKEN` resolves from
 host env (not committed).
 
-### Verified performance (27B)
+#### Verified performance (27B)
 
 `make bench` (default `TURNS=27`) grows the session to seq 63924 ≈ the 64k
 ceiling. Condensed (every 8th turn + final):
@@ -405,9 +413,9 @@ turn  prompt   out     seq  cached uncached  ttft_s prefill_tps  out_tps  lat_s 
 
 ---
 
-## Deployment B — Qwen3.6-35B-A3B-AWQ (MoE)
+### Deployment B — Qwen3.6-35B-A3B-AWQ (MoE)
 
-### Architecture
+#### Architecture
 
 ```
 Qwen3.6-35B-A3B-AWQ  —  40 transformer layers (hybrid)
@@ -434,7 +442,7 @@ The MoE keeps the same hybrid linear/full-attn split as the dense 27B but with
 **fewer layers (40 vs 64), fewer full-attn layers (10 vs 16), and a 2.5× smaller
 hidden (2048 vs 5120)** — that is the source of its larger context ceiling.
 
-### Why offload is required (measured envelope)
+#### Why offload is required (measured envelope)
 
 QuantTrio's AWQ→Marlin MoE repack (`awq_marlin_moe_repack`) needs ~128 MiB
 scratch with raw+Marlin coexisting; with 0 offload the 21.4 GiB weights leave no
@@ -470,7 +478,7 @@ Three levers, all required, make the 128k row work:
 | `--max-num-batched-tokens` | **1280** | ≥ the mamba align-mode block size 1072 (assertion `block_size <= max_num_batched_tokens` fires if smaller) and small enough to bound the prefill spike |
 | `--cpu-offload-gb` | **2.2** | frees the GPU headroom that lets Marlin repack + 128k KV both fit |
 
-### Working config (35B MoE)
+#### Working config (35B MoE)
 
 `docker-compose.moe.yaml` vLLM command — bulleted:
 
@@ -491,14 +499,14 @@ Three levers, all required, make the 128k row work:
 - `--enforce-eager`
 - `--enable-prefix-caching`
 - `--enable-auto-tool-choice`
-- `--tool-call-parser hermes`
+- `--tool-call-parser qwen3_xml`
 - `--reasoning-parser qwen3`
 - `--trust-remote-code`
 
 Env/volumes match the 27B compose (HF cache ro, `vllm_cache_moe` volume,
 `HF_TOKEN` from host env, `expandable_segments:True`).
 
-### Verified performance (35B MoE)
+#### Verified performance (35B MoE)
 
 `make bench35 TURNS=54` grows the session to seq 127 460 ≈ the 128k ceiling.
 Condensed (every 8th turn + final):
@@ -525,7 +533,7 @@ turn  prompt    out    seq   cached uncached  ttft_s prefill_tps  out_tps  lat_s
 - **Prefix-cache hit climbs 57 → 98 %** (cached = 124 352 = 116 × 1072-token
   blocks at turn 54); only the new ~2.6k-token turn is prefilled.
 
-### Offload efficiency cost
+#### Offload efficiency cost
 
 The 2.2 GiB UVA offload is not free at serving time:
 
@@ -542,7 +550,7 @@ The 2.2 GiB UVA offload is not free at serving time:
   generation throughput is a rolling average diluted by idle gaps, and a single
   idle sample shows 0 % hit. The per-turn bench numbers are authoritative, not the idle log.
 
-### MoE checkpoint status
+#### MoE checkpoint status
 
 Only the QuantTrio checkpoint is servable; the other two AWQ builds of this model
 are dead ends — do not retry without reason.
@@ -559,21 +567,20 @@ feature. (FP8 *KV* via FlashInfer works on Ampere and is used here.)
 
 ---
 
-## Idle power-down — the LiteLLM sole proxy
+### Idle power-down — the LiteLLM sole proxy
 
 Both stacks put **LiteLLM** (`ghcr.io/berriai/litellm:main-stable`) in front of
 vLLM as the single host-facing service on `0.0.0.0:4000`. It owns three things:
 
 1. **Translation** — Anthropic `/v1/messages` ↔ OpenAI `/v1/chat/completions`, so
-   Claude Code drives local Qwen3.6 as if it were Anthropic (see *Drive it with
-   Claude Code*). LiteLLM also normalizes the `ctx`/`msg`/`system` roles newer
+   Claude Code drives local Qwen3.6 as if it were Anthropic and opencode drives
+   it as OpenAI (see *Drive it with Claude Code* / *Drive it with opencode*).
+   LiteLLM also normalizes the `ctx`/`msg`/`system` roles newer
    Claude Code injects, which vLLM's native `/v1/messages` rejects with 400.
-2. **Thinking aliases** — three model names against one vLLM instance, differing
-   only in `chat_template_kwargs` (see *Thinking*); switchable via Claude Code's
-   `/model`.
-3. **The vLLM lifecycle** — a custom callback (`litellm_callbacks.py`, ported
-   from the previous `sidecar/` gate) wakes the backend on request and
-   `docker stop`s it after 15 min of inference-idle.
+2. **Three model names** — against one vLLM instance, differing only in
+   `chat_template_kwargs` (see *Thinking*); switchable via `/model`.
+3. **The vLLM lifecycle** — a custom callback (`litellm_callbacks.py`) wakes
+   the backend on request and `docker stop`s it after 15 min of inference-idle.
 
 **Goal, met: after 15 min idle the A10 draws ~15 W (< 50 W target).**
 
@@ -609,7 +616,7 @@ over the compose network at `http://vllm:8000`. LiteLLM binds
 `http://localhost:4000`; remote hosts hit the box's LAN IP (override
 `ANTHROPIC_BASE_URL` / `OPENAI_API_BASE_URL`).
 
-### Endpoints
+#### Endpoints
 
 Base URL `http://<host>:4000` — `<host>` is `localhost` on the box, its LAN IP
 from a remote host. Auth is **disabled** on all of these (no `master_key`); the LAN
@@ -620,28 +627,29 @@ is the trust boundary (see *Security*).
 | `POST /v1/messages` | **yes** | Anthropic Messages API — `bin/claude-qwen` / Claude Code |
 | `POST /v1/chat/completions` | **yes** | OpenAI Chat — open-webui, `make bench` |
 | `POST /v1/completions` | **yes** | OpenAI legacy completions |
-| `GET /v1/models` | no (cold) | lists the three aliases; safe for pollers (open-webui, gateway discovery) |
+| `GET /v1/models` | no (cold) | lists the three model names; safe for pollers (open-webui, gateway discovery) |
 | `GET /health/liveliness` | no | process-alive probe (`200 "I'm alive!"`, `503` while draining) |
 | `GET /health/readiness` | no | config + DB validity; safe for load balancers |
 | `GET /metrics` | no | LiteLLM's own Prometheus metrics (proxy-side; not vLLM's `/metrics`) |
 
-The completion routes flow through the `async_pre_call_hook`, which wakes the
-backend before the first byte. The cold routes are served from config / process
-state and never touch the GPU — that is why open-webui's model-list polling and
-Claude Code's gateway discovery cannot pin the card awake. The deep `GET /health`
-(not in the table) pings the backend directly, so it reports **unhealthy while vLLM
-is idle-stopped**; it carries no chat traffic and will not revive a stopped backend
-on its own — use `/health/liveliness` for an alive probe.
+The completion routes wake the backend before the first byte — the router path
+(`/v1/chat/completions`, `/v1/completions`) via `async_pre_call_hook`, the
+Anthropic pass-through (`/v1/messages`) via `async_pre_request_hook`. The cold
+routes are served from config / process state and never touch the GPU — that is
+why open-webui's model-list polling and Claude Code's gateway discovery cannot
+pin the card awake. The deep `GET /health` (not in the table) pings the backend
+directly, so it reports **unhealthy while vLLM is idle-stopped**; it carries no
+chat traffic and will not revive a stopped backend on its own — use
+`/health/liveliness` for an alive probe.
 
-**Wake is inference-triggered.** LiteLLM's `async_pre_call_hook` runs `ensure_up()`
-before every completion (coalesced behind a lock, so a burst wakes once). It fires
-only on real LLM calls — LiteLLM's own `/v1/models` and `/health` are served cold
-from config, so background pollers (open-webui's model-list polling, Claude Code's
-gateway discovery) cannot pin the GPU awake. While the backend is down,
-`/v1/models` still lists all three aliases and wake fires on the first message.
+**Wake is inference-triggered.** Both pre-call hooks run `ensure_up()` before
+every completion (coalesced behind a lock, so a burst wakes once) and fire only
+on real LLM calls — `/v1/models` and `/health` are served cold from config, so
+background pollers cannot pin the GPU awake. While the backend is down,
+`/v1/models` still lists all three model names; wake fires on the first message.
 
 **Idle detection.** A background task (started via
-`LITELLM_WORKER_STARTUP_HOOKS=litellm_callbacks.start_background_tasks`) polls
+`LITELLM_WORKER_STARTUP_HOOKS=litellm_callbacks:start_background_tasks`) polls
 `http://vllm:8000/metrics` (at the **root**, not `/v1`) every `POLL_SECONDS` and
 parses `vllm:num_requests_running`, `_waiting`, `_swapped`. Idle = all three
 `== 0` sustained `IDLE_SECONDS` (one busy poll resets the timer).
@@ -652,49 +660,70 @@ it, a freshly-started-but-unused stack would never idle-stop. Container control
 talks to the Engine API over `/var/run/docker.sock` via `httpx` (the litellm image
 ships no docker SDK).
 
-### Thinking — three aliases, one backend
+#### Thinking — three model names, one backend
 
 `preserve_thinking` and `enable_thinking` are **per-request** Qwen3.6 Jinja flags
 (verified in `QuantTrio/Qwen3.6-*/chat_template.jinja` — the 27B and MoE
 templates are byte-identical). One running vLLM serves all combos; LiteLLM sends
-the right `chat_template_kwargs` per alias:
+the right `chat_template_kwargs` per model name (`<base>` = `qwen3.6-27b` dense
+or `qwen3.6-35b-a3b` MoE):
 
-| LiteLLM alias | `preserve_thinking` | `enable_thinking` | use |
+| model name | `preserve_thinking` | `enable_thinking` | use |
 |---|---|---|---|
-| `claude-sonnet` | false | true (default) | **DEFAULT** — thinking shown this turn, not carried |
-| `claude-sonnet-preserve` | true | true (default) | **RARE** — carry prior `<think>` across turns |
-| `claude-haiku` | false | false | **BACKGROUND** — no reasoning pass (titles/summaries) |
+| `<base>` | false | true (default) | **DEFAULT** — thinking shown this turn, not carried |
+| `<base>-preserve` | true | true (default) | **RARE** — carry prior `<think>` across turns |
+| `<base>-nothink` | false | false | **BACKGROUND** — no reasoning pass (titles/summaries) |
 
 The template always keeps the **most-recent** turn's reasoning; `preserve_thinking`
 additionally keeps *older* turns. With `--reasoning-parser qwen3`, vLLM emits
-`reasoning_content` and LiteLLM's `/v1/messages` adapter is expected to render it
-as native Anthropic `{type:thinking}` blocks (the collapsible thinking UI).
+`reasoning_content`, which LiteLLM's `/v1/messages` adapter renders as native
+Anthropic `{type:thinking}` blocks (the collapsible thinking UI).
 
-> **Caveat (verify-gated).** `claude-sonnet-preserve` only re-renders prior
-> reasoning that is **actually present** in the incoming messages. Claude Code /
-> LiteLLM may strip prior assistant thinking from history, or name the field
-> `reasoning` where the template reads `reasoning_content`. So `claude-sonnet`
-> works fully today; `claude-sonnet-preserve` is a **no-op until reasoning
-> survives the round trip**. Closing it is a documented hook point in
-> `litellm_callbacks.async_pre_call_hook` (re-inject `reasoning_content` on prior
-> assistant messages, idempotent) — wire it only if a bench shows it's needed.
+**`-preserve` works end-to-end.** The Qwen3.6 chat template renders prior-turn
+reasoning only from `reasoning_content`, but on the `/v1/messages` path LiteLLM's
+Anthropic→OpenAI adapter attaches `thinking_blocks` instead (and rebuilds prior
+assistant turns *after* the hook fires). So an `async_pre_call_deployment_hook`
+normalizes `thinking_blocks`/`reasoning` → `reasoning_content` on prior assistant
+turns before vLLM renders them. Verified on `/v1/messages` (the Claude Code path):
+a 2-turn `-preserve` request carries ~44 extra prompt tokens of prior reasoning
+that the default strip variant drops.
 
-### Drive it with Claude Code
+#### Drive it with Claude Code
 
 ```bash
-./bin/claude-qwen           # sets ANTHROPIC_* env and execs `claude`
+./bin/claude-qwen           # 27B dense stack
+./bin/claude-qwen-moe       # 35B MoE stack
 ```
 
-`claude-qwen` points Claude Code at the proxy
-(`ANTHROPIC_BASE_URL=http://localhost:4000` by default, no `/v1`; override it to
-the box's LAN IP — e.g. `ANTHROPIC_BASE_URL=http://10.0.0.5:4000 ./bin/claude-qwen`
-— to drive from a remote host), sends a placeholder `ANTHROPIC_AUTH_TOKEN` (the
-proxy is auth-free; Claude Code just needs one non-empty), defaults the model to
-`claude-sonnet` and the background model to `claude-haiku`, and enables gateway
-model discovery so `/model` lists all three aliases. Switch mid-session:
-`/model claude-sonnet-preserve`. The host needs the `claude` CLI on `PATH`.
+`claude-qwen[-moe]` points Claude Code at the proxy
+(`ANTHROPIC_BASE_URL=http://localhost:4000`, no `/v1`), sends a placeholder
+`ANTHROPIC_AUTH_TOKEN` (the proxy is auth-free; Claude Code just needs one
+non-empty), sets the model to `qwen3.6-27b` / `qwen3.6-35b-a3b` and the
+background model to its `-nothink` variant, and enables gateway model discovery
+so `/model` lists all three flavors. Switch mid-session
+`/model qwen3.6-27b-preserve`, or set `QWEN_FLAVOR=preserve` before launch. Drive
+a remote box with `CLAUDE_QWEN_BASE_URL=http://10.0.0.5:4000 ./bin/claude-qwen`.
+The host needs the `claude` CLI on `PATH`.
 
-### Tuning, controls, security
+#### Drive it with opencode
+
+```bash
+./bin/opencode-qwen         # 27B dense stack
+./bin/opencode-qwen-moe     # 35B MoE stack
+```
+
+opencode ignores `OPENAI_BASE_URL` for its built-in `openai` provider, so the
+wrapper hands it a dedicated openai-compatible provider via a **private
+`XDG_CONFIG_HOME`** — a *copy* of `opencode-qwen[-moe].json` from this repo into
+a per-stack cache dir. That isolates the session from your global
+`~/.config/opencode/opencode.json` (a copy, not a symlink, so opencode's
+write-backs land on the disposable copy, not the committed file). Pick the model
+with `-m litellm/qwen3.6-27b[-preserve|-nothink]`, or set `QWEN_FLAVOR`; the
+`-nothink` variant is the config's `small_model`. Context/output caps match the
+proxy (`limit.context` 64k dense / 128k MoE, `limit.output` 16384). Drive a
+remote box with `OPENCODE_QWEN_BASE_URL=http://10.0.0.5:4000 ./bin/opencode-qwen`.
+
+#### Tuning & security
 
 | env (on the `litellm` service) | default | meaning |
 |---|---|---|
@@ -703,8 +732,10 @@ model discovery so `/model` lists all three aliases. Switch mid-session:
 | `VLLM_WAKE_TIMEOUT` | 240 (27B) / 300 (MoE) | cold-start health-wait budget |
 
 `make litellm-logs` / `make litellm-logs35` tail the proxy (wake/stop events log
-here). `docker stop` is deliberate, so vLLM's `restart: "no"` keeps it down until
-the next inference request; LiteLLM itself is `restart: unless-stopped`.
+here). The idle-stop is a deliberate `docker stop` (Engine API), so the backend
+stays exited until the next request — `restart: unless-stopped` honors an
+API-initiated stop (only a crash auto-restarts). LiteLLM itself is also
+`unless-stopped`.
 
 **Security — deliberate exposure.** LiteLLM is bound `0.0.0.0:4000` (reachable
 from the LAN, by design) and auth is **disabled** (no `master_key`: open-webui,
@@ -716,19 +747,17 @@ front later, set `master_key` in `litellm_config.yaml` and point clients'
 `ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY` at it; that gates the API, not the socket,
 so also tighten to `127.0.0.1:4000` once you stop needing remote access.
 
-**Surface & revert.** All state is in-repo (no systemd, cron, or
-`nvidia-smi -pm 1`). Reverting the tracked files to HEAD restores the direct-vLLM
-topology — vLLM on host `:8000`, `open-webui` → `http://vllm:8000/v1`, no proxy and
-no idle management; delete the three new files to finish:
-`make stop && git checkout docker-compose.yaml docker-compose.moe.yaml Makefile
-README.md scripts/coding_session_bench.py && rm -f litellm_config.yaml
-litellm_callbacks.py bin/claude-qwen` (then restart). The retired `sidecar/` gate
-(predecessor of `litellm_callbacks.py`) lives on disk but was never committed — its
-logic was ported into `litellm_callbacks.py`.
+**All state is in-repo** — no systemd, cron, or `nvidia-smi -pm 1`. The idle
+layer is the `litellm` compose service plus `litellm_callbacks.py`; both the
+config and the callback are mounted read-only. The proxy is additive — remove
+the `litellm` service from the composes (and the wrappers/JSONs/callback) to
+return to a direct-vLLM topology.
 
 ---
 
-## Prefix caching
+## Part 3 — Measurements & Operations
+
+### Prefix caching
 
 vLLM supports prefix caching for these hybrid models **experimentally**.
 `--enable-prefix-caching` forces `mamba_cache_mode='align'` and an attention
@@ -756,7 +785,7 @@ block size set by the mamba page alignment:
   can't be used for hit rate. (`make bench` can't read these through the LiteLLM
   proxy, so its `hit%` column reads 0 — TPS/TTFT are still valid.)
 
-### The reported `hit_rate` lags the real per-turn hit
+#### The reported `hit_rate` lags the real per-turn hit
 
 vLLM v1's `CachingMetrics.hit_rate` (stats.py:107) is
 `aggregated_query_hit / aggregated_query_total` over a **rolling deque of the
@@ -766,7 +795,104 @@ per-turn hit (from `/metrics` deltas) is already ~90 %+. By the end of the run
 the reported rate converges to ~98 %. A low reported `hit_rate` mid-run is not a
 bug — the per-turn bench column is authoritative, or wait for the rolling window to fill.
 
-## PCIe bandwidth — grounding the TP=2-on-x4 question
+### Experiments that did NOT work (do not retry without reason)
+
+#### MTP speculative decoding — does not fit on this GPU (27B)
+
+The checkpoint has an MTP head (`mtp_num_hidden_layers = 1`). vLLM v0.24.0 ships
+`vllm/model_executor/models/qwen3_5_mtp.py` and registers `Qwen3_5MTP`; enable
+with `--speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":1}'`.
+
+It OOMs at **drafter weight-load**, before any speculation runs, at every util
+tried (0.97, 0.94, 0.91) and `--max-num-batched-tokens` 1024 and 256:
+
+```
+Loading weights took 5.2s        # main model 18.83 GiB
+Loading drafter model...          # OOM: tried to allocate 340.00 MiB, 224 MiB free
+```
+
+Root cause: at drafter load the GPU holds weights (18.83 GiB) + fixed overhead
+(~3 GiB = FP16 embedding ~1.56 + CUDA ctx ~0.6 + cuDNN workspaces ~0.5 + activation/scratch ~0.35) ≈ 21.84
+GiB, leaving only ~184–224 MiB. The MTP head needs ~340 MiB. The shortfall is
+**independent of `num_speculative_tokens`** (1 vs 2 changes only runtime draft
+activations, not the head footprint) and **independent of util** (drafter loads
+before KV sizing). `--max-num-batched-tokens` 1024→256 freed only ~40 MiB — the
+overhead is fixed, not batch-token-driven.
+
+**Conclusion:** MTP is infeasible on this 24GB A10 with this 18.83 GiB model; a
+≥40 GB GPU would fit it. Expected gain if it fit: ~1.3–1.7× output TPS
+(single-token speculation, 1-layer head, ~50–70 % acceptance) → ~28–35 tps, not 2×.
+
+#### CUDA graphs (removing `--enforce-eager`) — costs more context than it gains
+
+Removing `--enforce-eager` enables `torch.compile` + CUDA graph capture. Compile
+worked (`cudagraph_capture_sizes: [1, 2]`), but engine init then failed KV sizing:
+
+```
+ValueError: 2.1 GiB KV cache is needed, which is larger than the available KV
+cache memory (1.86 GiB). Estimated maximum model length is 56000.
+```
+
+CUDA-graph memory profiling reserves memory for captured graphs, so
+`--gpu-memory-utilization=0.97` behaves like 0.9514 — KV drops ~2.1 → ~1.86 GiB,
+capping context at ~56k. Keeping 64k would need util ~0.99 (which OOMs). So CUDA
+graphs trade ~8k of context (64k → 56k) for a modest kernel-launch saving — not
+worth it, and the hybrid GatedDeltaNet layers add compile risk. `--enforce-eager`
+stays.
+
+#### CPU offload on the 27B (6 GiB) — rejected as too slow
+
+`--cpu-offload-gb 6` gives 128k context easily on the dense 27B but decode
+drops to ~2 tps (PCIe weight reads every step — the *whole* 27B reads CPU each
+token because every layer is active). Rejected as too slow. This is the opposite
+of the MoE path: on the MoE, only the offloaded expert fraction reads CPU and
+routing often misses the offloaded experts, so 2.2 GiB costs ~15 tps, not 2.
+
+#### Dead MoE checkpoints
+
+See [MoE checkpoint status](#moe-checkpoint-status) — mattbucci (garbage,
+hybrid-quant fusion breaks both runtimes) and cyankiwi (OOM at construction,
+param-bound). Do not retry without reason.
+
+### Hardware ceiling facts
+
+- **120k no-offload is impossible on this A10 for the dense 27B**: 22.06 −
+  18.83 = 3.23 GiB raw free (0.97 cap → 2.57); at ~35 KiB/token, 120k needs
+  ~4.0 GiB — over budget. Real ceiling 64 744 tokens (L152; the bare rate on
+  raw free is ~95k, but the 0.97 cap + non-KV overhead lower it to 64k).
+- **The MoE 35B is param-bound without offload** — weights 21.38 + reserve 0.44
+  = 21.82 GiB > the 21.40 GiB achievable at util 0.97. No amount of context fits
+  without `--cpu-offload-gb`; 2.2 GiB offload lifts it to 128k.
+- **`--gpu-memory-utilization` above ~0.99 fails** on this A10: free VRAM
+  21.83/22.06 = 0.9896, so 0.99×22.06 = 21.84 > 21.83.
+- **FP8 KV on Ampere** works via FlashInfer (auto-selected); no native FP8 tensor
+  cores needed. `int4_per_token_head` KV is nightly-only; TurboQuant 4-bit KV is
+  broken on hybrid Qwen3.5.
+
+### Gotchas
+
+- **open-webui persisted base URL**: `OPENAI_API_BASE_URL` env only seeds a fresh
+  DB. The `open-webui-data` volume persists `openai.api_base_urls` in sqlite
+  `config`, which takes precedence → empty model dropdown if it still points at
+  an old backend. Fix: update that DB row to `http://litellm:4000/v1` and restart,
+  or wipe the volume.
+- **Thinking mode**: the model is a thinking model. Without `--reasoning-parser
+  qwen3`, thinking tags are stripped (special tokens) and raw CoT dumps into
+  `content`, eating `max_tokens` → truncated answer. The parser moves thinking
+  to `message.reasoning`. Disable thinking per-request with
+  `chat_template_kwargs: {"enable_thinking": false}` (no server-side CLI flag
+  for this in v0.24.0).
+- **`HF_TOKEN`**: resolves from host env (`${HF_TOKEN}`); not committed. The
+  mounted HF cache is read-only and offline (`HF_HUB_OFFLINE=1`).
+- **Idle vLLM log lines are misleading**: `Avg generation throughput: 2.4 t/s`
+  and `Prefix cache hit rate: 0.0%` at idle are a rolling-average artifact and
+  an empty-window sample — not the serving rate. The per-turn bench column is authoritative.
+
+---
+
+## Part 4 — Scaling Beyond One A10
+
+### PCIe bandwidth — grounding the TP=2-on-x4 question
 
 `make bench_pcie` (`scripts/pcie_bw_bench.py`) measures GPU↔host cudaMemcpy
 bandwidth and bounds the TP=2 all-reduce cost on the x4 link. A10 negotiates
@@ -802,7 +928,7 @@ resolve is whether NCCL selects P2P or SHM on the 2-GPU board; identifiable only
 > reports Gen1. The bench warms the link first so the reported gen matches the
 > achieved bandwidth (Gen4).
 
-## Two A10 cards — TP=2 projections for Dense and MoE
+### Two A10 cards — TP=2 projections for Dense and MoE
 
 Two A10s on a single host (no NVLink — x4 only): lifts context ceilings and removes
 the MoE offload tax. The PCIe grounding above shows **TP=2 pays off for decode**
@@ -837,7 +963,7 @@ the MoE offload tax. The PCIe grounding above shows **TP=2 pays off for decode**
                  transport: P2P (1 hop) if ACS allows, else SHM (2 hops)
 ```
 
-### Footprint: MTP + visual are downloaded, not loaded
+#### Footprint: MTP + visual are downloaded, not loaded
 
 Both Qwen3.6 checkpoints ship with a **visual branch** and an **MTP head**.
 Both inflate the **download**, not the **VRAM footprint** — they are cut at load:
@@ -855,7 +981,7 @@ construction (the mattbucci-CT trap — see [MoE checkpoint status](#moe-checkpo
 MTP, if opted in, OOMs on a 24GB card (drafter head ~340 MiB, <220 MiB free) —
 needs a ≥40 GB GPU.
 
-### Why TP=2, not PP=2, for single-user serving on x4
+#### Why TP=2, not PP=2, for single-user serving on x4
 
 - **TP=2 parallelizes the GDDR6 weight reads** (the actual decode bottleneck) —
   each GPU reads half the weights per step → faster decode. All-reduce at
@@ -867,7 +993,7 @@ needs a ≥40 GB GPU.
   not make it **faster**. PP's smaller comm footprint only wins at **high
   batch / multi-user throughput**, a different goal.
 
-### Projected decode tps
+#### Projected decode tps
 
 Dense decode is GDDR6-bound: `tps ≈ BW / weights_read_per_token × ~0.7`. The formula
 is decode-only; MoE uses a separate active-read envelope because the single-GPU
@@ -890,11 +1016,10 @@ The 2×A10 projections' reasoning:
   `--max-model-len`, not memory. The single-A10 dense path needs
   `--cpu-offload-gb 6` for 128k and collapses to ~2.5 tps; TP=2 avoids that
   offload path.
-- **Dense 27B decode at 128k is ~35 tps projected.** The old ~40–42 tps estimate
-  was the short-context TP=2 projection. At 128k, the 16 fp8 full-attention
-  layers add ~2.0 GiB/GPU of KV read per decoded token on top of the ~9.4 GiB/GPU
-  weight shard. Applying the measured dense efficiency gives ~34–36 tps, so
-  use ~35 tps as the 128k planning number.
+- **Dense 27B decode at 128k is ~35 tps projected.** At 128k, the 16 fp8
+  full-attention layers add ~2.0 GiB/GPU of KV read per decoded token on top of
+  the ~9.4 GiB/GPU weight shard. Applying the measured dense efficiency gives
+  ~34–36 tps, so use ~35 tps as the 128k planning number.
 
 - **No offload needed** — ~21.5 GiB / 2 ≈ 11 GiB/GPU weights, ample room for
   KV+state. Removing offload removes the PCIe-stall tax (the 80 %-power ceiling)
@@ -930,7 +1055,7 @@ The 2×A10 projections' reasoning:
   max-context config, not by VRAM; the 1072-token mamba align block still
   requires `--max-num-batched-tokens ≥ 1072`.
 
-### Config diff (single-GPU → 2-GPU TP=2)
+#### Config diff (single-GPU → 2-GPU TP=2)
 
 | setting | 27B single A10 | 27B 2× TP=2 | 35B MoE single A10 | 35B MoE 2× TP=2 |
 |---|---|---|---|---|
@@ -945,7 +1070,7 @@ The 2×A10 projections' reasoning:
 | `shm_size` | 32g | 32g | 32g | 32g |
 | `NCCL_DEBUG` env | — | `INFO` | `INFO` | `INFO` |
 
-### How to verify when running it for real
+#### How to verify when running it for real
 
 - `nvidia-smi` per-GPU memory **balanced** (~equal) → TP shards both layer types.
 - `NCCL_DEBUG=INFO` log: `via P2P/IPC` (best) or `via SHM` (fallback, fine);
@@ -955,7 +1080,7 @@ The 2×A10 projections' reasoning:
   15.4 tps means the run is still effectively on the offloaded/single-GPU path,
   TP is not sharding the hybrid layers, or init fell back/failed.
 
-### Open risks (not resolvable on a 1-GPU box)
+#### Open risks (not resolvable on a 1-GPU box)
 
 - **vLLM's TP sharding of the GatedDeltaNet linear-attn layers is unverified**
   — the main risk for both models. If TP only shards the full-attn layers, load
@@ -963,96 +1088,3 @@ The 2×A10 projections' reasoning:
   catches this.
 - x4 prefill tax ~10–20 % (P2P vs SHM).
 - PP=2 at batch=1 → ~same latency as 1 GPU + comm; don't use PP for single-user.
-
-## Experiments that did NOT work (do not retry without reason)
-
-### MTP speculative decoding — does not fit on this GPU (27B)
-
-The checkpoint has an MTP head (`mtp_num_hidden_layers = 1`). vLLM v0.24.0 ships
-`vllm/model_executor/models/qwen3_5_mtp.py` and registers `Qwen3_5MTP`; enable
-with `--speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":1}'`.
-
-It OOMs at **drafter weight-load**, before any speculation runs, at every util
-tried (0.97, 0.94, 0.91) and `--max-num-batched-tokens` 1024 and 256:
-
-```
-Loading weights took 5.2s        # main model 18.83 GiB
-Loading drafter model...          # OOM: tried to allocate 340.00 MiB, 224 MiB free
-```
-
-Root cause: at drafter load the GPU holds weights (18.83 GiB) + fixed overhead
-(~3 GiB = FP16 embedding ~1.56 + CUDA ctx ~0.6 + cuDNN workspaces ~0.5 + activation/scratch ~0.35) ≈ 21.84
-GiB, leaving only ~184–224 MiB. The MTP head needs ~340 MiB. The shortfall is
-**independent of `num_speculative_tokens`** (1 vs 2 changes only runtime draft
-activations, not the head footprint) and **independent of util** (drafter loads
-before KV sizing). `--max-num-batched-tokens` 1024→256 freed only ~40 MiB — the
-overhead is fixed, not batch-token-driven.
-
-**Conclusion:** MTP is infeasible on this 24GB A10 with this 18.83 GiB model; a
-≥40 GB GPU would fit it. Expected gain if it fit: ~1.3–1.7× output TPS
-(single-token speculation, 1-layer head, ~50–70 % acceptance) → ~28–35 tps, not 2×.
-
-### CUDA graphs (removing `--enforce-eager`) — costs more context than it gains
-
-Removing `--enforce-eager` enables `torch.compile` + CUDA graph capture. Compile
-worked (`cudagraph_capture_sizes: [1, 2]`), but engine init then failed KV sizing:
-
-```
-ValueError: 2.1 GiB KV cache is needed, which is larger than the available KV
-cache memory (1.86 GiB). Estimated maximum model length is 56000.
-```
-
-CUDA-graph memory profiling reserves memory for captured graphs, so
-`--gpu-memory-utilization=0.97` behaves like 0.9514 — KV drops ~2.1 → ~1.86 GiB,
-capping context at ~56k. Keeping 64k would need util ~0.99 (which OOMs). So CUDA
-graphs trade ~8k of context (64k → 56k) for a modest kernel-launch saving — not
-worth it, and the hybrid GatedDeltaNet layers add compile risk. `--enforce-eager`
-stays.
-
-### CPU offload on the 27B (6 GiB) — rejected as too slow
-
-`--cpu-offload-gb 6` gives 128k context easily on the dense 27B but decode
-drops to ~2 tps (PCIe weight reads every step — the *whole* 27B reads CPU each
-token because every layer is active). Rejected as too slow. This is the opposite
-of the MoE path: on the MoE, only the offloaded expert fraction reads CPU and
-routing often misses the offloaded experts, so 2.2 GiB costs ~15 tps, not 2.
-
-### Dead MoE checkpoints
-
-See [MoE checkpoint status](#moe-checkpoint-status) — mattbucci (garbage,
-hybrid-quant fusion breaks both runtimes) and cyankiwi (OOM at construction,
-param-bound). Do not retry without reason.
-
-## Hardware ceiling facts
-
-- **120k no-offload is impossible on this A10 for the dense 27B**: 22.06 −
-  18.83 = 3.23 GiB raw free (0.97 cap → 2.57); at ~35 KiB/token, 120k needs
-  ~4.0 GiB — over budget. Real ceiling 64 744 tokens (L152; the bare rate on
-  raw free is ~95k, but the 0.97 cap + non-KV overhead lower it to 64k).
-- **The MoE 35B is param-bound without offload** — weights 21.38 + reserve 0.44
-  = 21.82 GiB > the 21.40 GiB achievable at util 0.97. No amount of context fits
-  without `--cpu-offload-gb`; 2.2 GiB offload lifts it to 128k.
-- **`--gpu-memory-utilization` above ~0.99 fails** on this A10: free VRAM
-  21.83/22.06 = 0.9896, so 0.99×22.06 = 21.84 > 21.83.
-- **FP8 KV on Ampere** works via FlashInfer (auto-selected); no native FP8 tensor
-  cores needed. `int4_per_token_head` KV is nightly-only; TurboQuant 4-bit KV is
-  broken on hybrid Qwen3.5.
-
-## Gotchas
-
-- **open-webui persisted base URL**: `OPENAI_API_BASE_URL` env only seeds a fresh
-  DB. The `open-webui-data` volume persists `openai.api_base_urls` in sqlite
-  `config`, which takes precedence → empty model dropdown if it still points at
-  an old backend. Fix: update that DB row to `http://litellm:4000/v1` and restart,
-  or wipe the volume. (Pre-LiteLLM it was `http://vllm:8000/v1`.)
-- **Thinking mode**: the model is a thinking model. Without `--reasoning-parser
-  qwen3`, thinking tags are stripped (special tokens) and raw CoT dumps into
-  `content`, eating `max_tokens` → truncated answer. The parser moves thinking
-  to `message.reasoning`. Disable thinking per-request with
-  `chat_template_kwargs: {"enable_thinking": false}` (no server-side CLI flag
-  for this in v0.24.0).
-- **`HF_TOKEN`**: resolves from host env (`${HF_TOKEN}`); not committed. The
-  mounted HF cache is read-only and offline (`HF_HUB_OFFLINE=1`).
-- **Idle vLLM log lines are misleading**: `Avg generation throughput: 2.4 t/s`
-  and `Prefix cache hit rate: 0.0%` at idle are a rolling-average artifact and
-  an empty-window sample — not the serving rate. The per-turn bench column is authoritative.
