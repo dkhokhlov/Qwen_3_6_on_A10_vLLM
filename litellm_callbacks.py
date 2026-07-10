@@ -25,9 +25,12 @@ Why a registered CustomLogger with TWO hooks, not litellm_settings.callbacks:
   unmodified. Waking here fires ONLY on real LLM calls, so /v1/models, /health,
   /metrics (served cold from config) never wake vLLM.
 
-Container control talks to the Engine API over the mounted /var/run/docker.sock
-via httpx (the litellm image ships no docker SDK). The startup-hook loader uses
-plain importlib.import_module, so the compose service sets PYTHONPATH=/app.
+Container control talks to the Engine API via httpx (the litellm image ships no
+docker SDK). Under compose it reaches the docker-sock-proxy sidecar over HTTP
+(DOCKER_API_BASE), which holds the host socket and is whitelisted to
+start/stop + `/_ping`; with DOCKER_API_BASE unset it falls back to
+the mounted /var/run/docker.sock UDS (local dev). The startup-hook loader
+uses plain importlib.import_module, so the compose service sets PYTHONPATH=/app.
 """
 from __future__ import annotations
 
@@ -55,6 +58,10 @@ POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "10"))
 WAKE_TIMEOUT_SECONDS = float(os.environ.get("WAKE_TIMEOUT_SECONDS", "240"))
 # A compose cold boot can exceed a single wake window; give bootstrap a long leash.
 BOOT_TIMEOUT_SECONDS = float(os.environ.get("BOOT_TIMEOUT_SECONDS", "600"))
+# Compose: base URL of the docker-sock-proxy sidecar (whitelists start/stop + /_ping).
+# Repo-specific name (not DOCKER_HOST -- that implies tcp:// / unix:// to Docker
+# tooling; this client wants a plain http:// URL). Unset -> UDS fallback in Backend.
+DOCKER_API_BASE = os.environ.get("DOCKER_API_BASE")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 
 
@@ -118,12 +125,17 @@ class Backend:
         self._wake_lock = asyncio.Lock()
         # Health + metrics client over the compose network.
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
-        # Engine API over the unix socket; the URL host is cosmetic for a UDS transport.
-        transport = httpx.AsyncHTTPTransport(uds=DOCKER_SOCK)
-        self._docker = httpx.AsyncClient(
-            transport=transport, base_url="http://docker",
-            timeout=httpx.Timeout(60.0, connect=10.0),
-        )
+        # Engine API: over the docker-sock-proxy sidecar (HTTP) under compose, or the
+        # host unix socket (UDS) for local dev. Both POST start/stop calls below are
+        # relative, so they resolve against either base_url unchanged.
+        if DOCKER_API_BASE:
+            self._docker = httpx.AsyncClient(
+                base_url=DOCKER_API_BASE, timeout=httpx.Timeout(60.0, connect=10.0))
+        else:
+            transport = httpx.AsyncHTTPTransport(uds=DOCKER_SOCK)
+            self._docker = httpx.AsyncClient(
+                transport=transport, base_url="http://docker",
+                timeout=httpx.Timeout(60.0, connect=10.0))
 
     # -- lifecycle --------------------------------------------------------
     async def bootstrap(self) -> None:

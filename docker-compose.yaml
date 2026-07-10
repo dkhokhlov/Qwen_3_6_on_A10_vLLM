@@ -46,6 +46,33 @@ services:
     restart: unless-stopped   # crash (e.g. OOM) auto-restarts; engine-API stop (idle) still
                               # sticks; wake-on-request (ensure_up) backstops per request
 
+  # docker-sock-proxy: holds the root-equivalent Docker socket so LiteLLM doesn't.
+  # HAProxy whitelist -> POST /containers/<name>/{start,stop} + GET /_ping ONLY;
+  # create/delete/exec/images/secrets/volumes/networks all return 403. Internal
+  # network only (no host port); litellm is its sole peer. See litellm_callbacks.py.
+  docker-sock-proxy:
+    image: tecnativa/docker-socket-proxy@sha256:1f3a6f303320723d199d2316a3e82b2e2685d86c275d5e3deeaf182573b47476   # Docker Hub (GHCR denied w/o auth); HAProxy 3.2.4, built 2025-12-16
+    container_name: docker-sock-proxy-qwen
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # rw: HAProxy connect()s the UDS; the proxy IS the trust boundary
+    environment:
+      POST: "1"
+      ALLOW_START: "1"
+      ALLOW_STOP: "1"
+      CONTAINERS: "0"        # no list/inspect/create/delete
+      EVENTS: "0"            # revoke upstream default (info leak)
+      VERSION: "0"           # revoke upstream default
+      PING: "1"              # keep: backs the healthcheck
+      LOG_LEVEL: info
+    networks:
+      - docker-api           # internal-only; NOT on the default network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:2375/_ping || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
   # LiteLLM sole proxy: Anthropic<->OpenAI translation + three model names
   # (bare/-preserve/-nothink), and owns the vllm lifecycle (wake-on-request,
   # idle-stop). See litellm_config.yaml + litellm_callbacks.py.
@@ -59,6 +86,7 @@ services:
       LITELLM_VLLM_API_BASE: http://vllm:8000/v1
       BACKEND_CONTAINER: vllm-qwen
       BACKEND_URL: http://vllm:8000
+      DOCKER_API_BASE: http://docker-sock-proxy:2375   # Engine API via the whitelisted sidecar (no raw socket mount)
       IDLE_SECONDS: "${VLLM_IDLE_SECONDS:-900}"
       POLL_SECONDS: "${VLLM_POLL_SECONDS:-10}"
       WAKE_TIMEOUT_SECONDS: "${VLLM_WAKE_TIMEOUT:-240}"
@@ -67,8 +95,18 @@ services:
     volumes:
       - ./litellm_config.yaml:/app/litellm_config.yaml:ro
       - ./litellm_callbacks.py:/app/litellm_callbacks.py:ro
-      - /var/run/docker.sock:/var/run/docker.sock
     command: --config /app/litellm_config.yaml --port 4000
+    networks:
+      - default      # reach vllm:8000 + open-webui; publish :4000
+      - docker-api   # reach docker-sock-proxy only
+    depends_on:
+      - docker-sock-proxy
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:4000/health/liveliness\").status==200 else 1)'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
 
   open-webui:
@@ -83,8 +121,18 @@ services:
       - open-webui-data:/app/backend/data
     depends_on:
       - litellm
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:8080/health\").status==200 else 1)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     restart: unless-stopped
 
 volumes:
   open-webui-data:
   vllm_cache:
+
+networks:
+  docker-api:
+    internal: true   # no host port, no egress; the proxy + litellm are its only members

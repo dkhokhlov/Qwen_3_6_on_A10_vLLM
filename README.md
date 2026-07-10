@@ -101,11 +101,13 @@ TPS, and prefix-cache hit %. Cache hit is read from vLLM `/metrics` (at the
 
 ### Security
 
-The proxy binds `0.0.0.0:4000` (LAN-reachable) with auth **disabled** and mounts
-`/var/run/docker.sock` read-write (root-equivalent host control). vLLM is also
-published on `0.0.0.0:8000` (raw OpenAI API + `/metrics`; no socket mount, but
-unauthenticated inference). Treat any host that can reach `:4000` or `:8000` as
-trusted — this is deliberate; see
+The proxy binds `0.0.0.0:4000` (LAN-reachable) with auth **disabled**. It does
+**not** mount the Docker socket directly — a `docker-sock-proxy` sidecar holds
+`/var/run/docker.sock` and exposes only `POST /containers/<name>/{start,stop}`
+(+`GET /_ping`) over an internal network; every other Engine call
+(create/delete/exec/images/secrets/volumes/networks) returns 403. vLLM is also published on
+`0.0.0.0:8000` (raw OpenAI API + `/metrics`; unauthenticated inference). Treat any
+host that can reach `:4000` or `:8000` as trusted — this is deliberate; see
 [Tuning & security](#tuning--security) for the full exposure and how to lock it down.
 
 ## Part 2 — Single-A10 Deployments
@@ -677,11 +679,11 @@ background pollers cannot pin the GPU awake. While the backend is down,
 parses `vllm:num_requests_running`, `_waiting`, `_swapped`. Idle = all three
 `== 0` sustained `IDLE_SECONDS` (one busy poll resets the timer).
 `num_requests_swapped` is absent in vLLM v1 and is treated as 0. On idle →
-`POST /containers/{name}/stop` over the docker socket. At startup a `bootstrap()`
-task waits for the warm-started backend's `/health` and arms the timer — without
-it, a freshly-started-but-unused stack would never idle-stop. Container control
-talks to the Engine API over `/var/run/docker.sock` via `httpx` (the litellm image
-ships no docker SDK).
+`POST /containers/{name}/stop`. At startup a `bootstrap()` task waits for the
+warm-started backend's `/health` and arms the timer — without it, a
+freshly-started-but-unused stack would never idle-stop. Container control talks to
+the Engine API via the `docker-sock-proxy` sidecar (`DOCKER_API_BASE`) over `httpx`
+(the litellm image ships no docker SDK); the sidecar whitelists only `start`/`stop` + `/_ping`.
 
 #### Thinking — three model names, one backend
 
@@ -762,16 +764,22 @@ API-initiated stop (only a crash auto-restarts). LiteLLM itself is also
 
 **Security — deliberate exposure.** LiteLLM is bound `0.0.0.0:4000` (reachable
 from the LAN, by design) and auth is **disabled** (no `master_key`: open-webui,
-the bench, and remote Claude Code hosts need no API key). The service also mounts
-`/var/run/docker.sock` read-write (start/stop needs write, which is root-equivalent
-host control). Net effect: **any host that can reach `:4000` can start/stop
-arbitrary containers on this box** — treat the network as trusted. vLLM's
-`0.0.0.0:8000` is the same posture but lighter: it exposes the OpenAI API and
-`/metrics` (unauthenticated inference + prefix-cache counters), not the Docker
-socket. To put a key in
+the bench, and remote Claude Code hosts need no API key). The service does **not**
+mount the Docker socket. Instead a `docker-sock-proxy` sidecar — on a dedicated
+internal network that only LiteLLM joins — holds `/var/run/docker.sock` and
+whitelists `POST /containers/<name>/{start,stop}` plus `GET /_ping`; every other
+Engine call (create/delete/exec/images/secrets/volumes/networks) returns 403. Net
+effect: a caller who compromises LiteLLM (or any host that reaches `:4000` and
+achieves code exec there) can start/stop **any existing container** on this box
+(host-wide DoS; privilege recovery if a privileged/host-mounted container exists)
+but can no longer create containers, exec into them, pull images, or read secrets —
+the privileged-container root-escape (`POST /containers/create` with a host bind)
+is closed. vLLM's `0.0.0.0:8000` is the same LAN posture but lighter: it exposes
+the OpenAI API and `/metrics` (unauthenticated inference + prefix-cache counters),
+not the Docker socket. To put a key in
 front later, set `master_key` in `litellm_config.yaml` and point clients'
-`ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY` at it; that gates the API, not the socket,
-so also tighten to `127.0.0.1:4000` once you stop needing remote access.
+`ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY` at it; that gates the API. Tighten to
+`127.0.0.1:4000` once you stop needing remote access.
 
 **All state is in-repo** — no systemd, cron, or `nvidia-smi -pm 1`. The idle
 layer is the `litellm` compose service plus `litellm_callbacks.py`; both the
