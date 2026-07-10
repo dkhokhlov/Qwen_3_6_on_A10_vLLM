@@ -8,13 +8,13 @@
 [![license](https://img.shields.io/badge/license-MIT-yellow)](./LICENSE)
 
 Serve the latest [**Qwen3.6**](https://huggingface.co/collections/Qwen/qwen36) — a
-**Dense** model and a **Mixture-of-Experts (MoE)** model, built for **agentic coding**
+**dense** model and a **mixture-of-experts (MoE)** model, built for **agentic coding**
 and tool use — on a single [NVIDIA A10](https://www.techpowerup.com/gpu-specs/a10-pcie.c3793)
 (24GB) with vLLM. Qwen reports 73–77% on SWE-bench Verified for the two base models.
 Real measured throughput at full context:
 
 - **[Qwen3.6-27B-AWQ](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ) — a
-  Dense model** (27B active params, no experts) at full **64k context, no CPU
+  dense model** (27B active params, no experts) at full **64k context, no CPU
   offload**, output `21tps` flat to max context.
 - **[Qwen3.6-35B-A3B-AWQ](https://huggingface.co/QuantTrio/Qwen3.6-35B-A3B-AWQ)
   — a MoE model** (35B total / 3B active, 256 routed experts) at full **128k
@@ -83,7 +83,7 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 | `make bench35` | same bench on the 35B MoE (override `TURNS=N`; `TURNS=54` → ~128k) |
 | `make bench_pcie` | GPU↔host PCIe bandwidth (needs a free GPU: `make stop` first) |
 
-`run`/`start`/`stop` target the 27B Dense stack (`docker-compose.yaml`);
+`run`/`start`/`stop` target the 27B dense stack (`docker-compose.yaml`);
 `run35`/`start35`/`stop35` target the 35B MoE stack (`docker-compose.moe.yaml`).
 The two stacks share host port `4000` (the LiteLLM proxy) and the one GPU, so stop
 one before starting the other.
@@ -270,7 +270,7 @@ W4A16** kernel — a fused dequant + INT4-GEMM — which needs the weights in a
 different, reordered tiling. So at load vLLM **repacks** AWQ → Marlin: the weight
 tensor is reordered, scales/zero-points reorganized into one packed tensor the
 kernel reads directly, and dequant happens *inside* the GEMM (no separate dequant
-pass). The Dense repack is automatic; the **MoE** repack
+pass). The dense repack is automatic; the **MoE** repack
 (`awq_marlin_moe_repack`) needs ~128 MiB scratch with raw + Marlin coexisting —
 which is exactly why the MoE run **offloads 2.2 GiB before the repack** (see
 [MoE no-offload math](#moe-no-offload-math-why-offload-is-required-not-optional)).
@@ -291,7 +291,7 @@ both decode flat to max context.
 
 Same AWQ-INT4 + Marlin recipe; the only model-specific wrinkle is the MoE
 repack's transient scratch, which is what makes offload mandatory for the 35B
-(the 27B needs none). Both decode flat to their max context — Dense ~21 tps at
+(the 27B needs none). Both decode flat to their max context — dense ~21 tps at
 64k, MoE ~15.4 tps at 128k — precisely because AWQ-Marlin keeps their weights
 small enough to leave room for KV.
 
@@ -1053,7 +1053,7 @@ needs a ≥40 GB GPU.
 
 - **TP=2 parallelizes the GDDR6 weight reads** (the actual decode bottleneck) —
   each GPU reads half the weights per step → faster decode. All-reduce at
-  batch=1 is small on x4: ~640 KiB/token one-way for the 27B Dense and
+  batch=1 is small on x4: ~640 KiB/token one-way for the 27B dense and
   ~320 KiB/token for the 35B MoE nominal two-collective/layer path used below.
 - **PP=2 at batch=1 does not overlap** (no pipeline to fill) — stages run
   serially, one GPU idle each half-step → ~same latency as a single GPU that
@@ -1143,7 +1143,7 @@ The 2×A10 projections' reasoning:
 - `nvidia-smi` per-GPU memory **balanced** (~equal) → TP shards both layer types.
 - `NCCL_DEBUG=INFO` log: `via P2P/IPC` (best) or `via SHM` (fallback, fine);
   `via NET` would indicate TCP (shouldn't happen intra-node).
-- 27B Dense decode ~35 tps at 128k; 35B MoE decode ~120+ tps at short/moderate context, or
+- 27B dense decode ~35 tps at 128k; 35B MoE decode ~120+ tps at short/moderate context, or
   materially above 15.4 tps at 256k → no-offload TP is working. MoE stuck near
   15.4 tps means the run is still effectively on the offloaded/single-GPU path,
   TP is not sharding the hybrid layers, or init fell back/failed.
