@@ -1,0 +1,17 @@
+# Tooling config for the pytest regression suite. (No [project] packaging: the repo
+# is a deployment, not a library.) Lives here rather than pytest.ini/.coveragerc
+# because the repo .gitignore masks dotfiles.
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]          # bare `pytest` == fast hermetic suite (make test)
+asyncio_mode = "auto"               # async tests need no @pytest.mark.asyncio boilerplate
+addopts = "--strict-markers --strict-config -ra --cov=litellm_callbacks --cov=scripts --cov-report=term-missing"
+markers = [
+    "unit: fast, hermetic unit + config tests (no GPU/docker)",
+    "integration: long tests against the live stack (needs `make start35` + GPU)",
+]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+show_missing = true

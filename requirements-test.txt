@@ -1,0 +1,10 @@
+# Test dependencies for the pytest regression suite (make test / make test-integration).
+# `litellm` is intentionally NOT here: it only runs inside the proxy container. Unit
+# tests import litellm_callbacks.py against a minimal litellm stub injected by
+# tests/conftest.py, so the fast suite stays hermetic (no heavy install).
+pytest
+pytest-cov
+pytest-asyncio
+pyyaml
+requests
+httpx
