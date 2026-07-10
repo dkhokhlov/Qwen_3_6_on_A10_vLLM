@@ -10,7 +10,7 @@
 Serve the latest [**Qwen3.6**](https://huggingface.co/collections/Qwen/qwen36) — a
 **dense** model and a **mixture-of-experts (MoE)** model, built for **agentic coding**
 and tool use — on a single [NVIDIA A10](https://www.techpowerup.com/gpu-specs/a10-pcie.c3793)
-(24GB) with vLLM. Qwen reports 73–77% on SWE-bench Verified for the two base models.
+(24GB) with [vLLM](https://github.com/vllm-project/vllm). Qwen reports 73–77% on [SWE-bench](https://www.swebench.com) Verified for the two base models.
 Real measured throughput at full context:
 
 - **[Qwen3.6-27B-AWQ](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ) — a
@@ -25,9 +25,9 @@ Real measured throughput at full context:
 hidden dim). The MoE's 35B weights don't fit without offload; the dense 27B fits
 cleanly. See [Dense vs MoE — why the bigger model serves more context](#dense-vs-moe--why-the-bigger-model-serves-more-context).
 
-**Both models are AWQ-INT4** — activation-aware 4-bit quantization (group
+**Both models are [AWQ](https://arxiv.org/abs/2306.00978)-INT4** — activation-aware 4-bit quantization (group
 128, asymmetric), not naive round-to-nearest — which is why a 27B and a 35B
-model both fit on 24GB at near-FP16 quality. vLLM's Marlin kernel keeps them
+model both fit on 24GB at near-FP16 quality. vLLM's [Marlin](https://arxiv.org/abs/2401.00755) kernel keeps them
 packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 [AWQ quantization — the method, and why both models use it](#awq-quantization--the-method-and-why-both-models-use-it).
 
@@ -64,7 +64,7 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 
 | need | why | install |
 |---|---|---|
-| Docker Engine | runs the vLLM + LiteLLM + open-webui stack | [docs.docker.com/engine/install](https://docs.docker.com/engine/install/) |
+| Docker Engine | runs the vLLM + [LiteLLM](https://github.com/BerriAI/litellm) + [Open WebUI](https://github.com/open-webui/open-webui) stack | [docs.docker.com/engine/install](https://docs.docker.com/engine/install/) |
 | NVIDIA Container Toolkit | passes the A10 through to the vLLM container | [install guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) |
 | python3 | the coding-session benches and the pytest suite (`make test`) | system python ≥ 3.10; tests add `pip install -r requirements-test.txt` |
 
