@@ -882,6 +882,21 @@ token because every layer is active). Rejected as too slow. This is the opposite
 of the MoE path: on the MoE, only the offloaded expert fraction reads CPU and
 routing often misses the offloaded experts, so 2.2 GiB costs ~15 tps, not 2.
 
+#### KV-cache offloading (`--kv_offloading_backend`) — wrong lever, not a ceiling-raiser
+
+`--kv_offloading_backend native --kv_offloading_size <GiB>` (vLLM's OffloadingConnector,
+RFC #26858) is unrelated to the `--cpu-offload-gb` *weight* offload used on the MoE above.
+It ships *completed* prefix-cache blocks to pinned host RAM so a later request sharing that
+prefix is restored instead of recomputed — i.e. it extends the **prefix cache**, not the
+per-sequence context window. The in-flight sequence's active KV cannot spill to CPU via this
+connector, so it raises none of the ceilings in [Hardware ceiling facts](#hardware-ceiling-facts):
+not the dense 27B's ~4.0 GiB-for-120k gap, not the MoE's param-bound fit. (The mechanism that
+*can* move a running sequence's KV is preemption/swap, not this connector — and at
+`--max-num-seqs 1` that stalls decode on the hot path, the same PCIe tax that sank
+`--cpu-offload-gb 6` above.) It is also moot at single-user batch 1: no concurrent request
+evicts the prefix cache, so the host tier would sit idle. KV offloading is a multi-tenant /
+high-throughput feature; neither stack uses it. Do not add it expecting more context.
+
 #### Dead MoE checkpoints
 
 See [MoE checkpoint status](#moe-checkpoint-status) — mattbucci (garbage,
