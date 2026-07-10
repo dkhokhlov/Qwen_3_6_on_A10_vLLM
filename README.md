@@ -92,8 +92,8 @@ one before starting the other.
   - Anthropic `/v1/messages` **and** OpenAI `/v1/*` — same base
   - three model names per stack: `<base>` (default), `<base>-preserve`, `<base>-nothink`
     — `<base>` is `qwen3.6-27b` (dense) / `qwen3.6-35b-a3b` (MoE)
-- Claude Code: `./bin/claude-qwen` / `./bin/claude-qwen-moe` (see *Drive it with Claude Code*)
-- opencode: `./bin/opencode-qwen` / `./bin/opencode-qwen-moe` (see *Drive it with opencode*)
+- Claude Code: `./bin/claude-qwen [--model moe|dense]` (see *Drive it with Claude Code*)
+- opencode: `./bin/opencode-qwen [--model moe|dense]` (see *Drive it with opencode*)
 - open-webui: `http://localhost:3000/`
 - vLLM direct (metrics + harness): `http://localhost:8000` — LAN-open; `/metrics` (prefix-cache hit%) + raw OpenAI API for test harnesses. Chat clients use the proxy (`:4000`), not this.
 
@@ -111,9 +111,9 @@ TPS, and prefix-cache hit %. Cache hit is read from vLLM `/metrics` (at the
 | `docker-compose.moe.yaml` | vLLM (35B MoE, 128k, 2.2 GiB offload) + LiteLLM stack |
 | `litellm_config.yaml` / `.moe.yaml` | LiteLLM config per stack: three model names, one shared backend (env-driven) |
 | `litellm_callbacks.py` | custom callback: wake-on-request + idle-stop |
-| `bin/claude-qwen` / `-moe` | Claude Code wrappers: set `ANTHROPIC_*` env, exec `claude` against the proxy |
-| `bin/opencode-qwen` / `-moe` | opencode wrappers: private `XDG_CONFIG_HOME` pointing at our provider |
-| `opencode-qwen.json` / `-moe.json` | opencode provider config the wrappers copy from (baseURL, model limits) |
+| `bin/claude-qwen` | Claude Code wrapper: `--model {moe|dense}` (default moe), sets `ANTHROPIC_*` env, execs `claude` against the proxy |
+| `bin/opencode-qwen` | opencode wrapper: `--model {moe|dense}` (default moe), private `XDG_CONFIG_HOME` pointing at our provider |
+| `opencode-qwen.json` / `-moe.json` | opencode provider config the wrapper copies from (baseURL, model limits; 64k dense / 128k MoE) |
 | `Makefile` | `run` / `start` / `stop` / `run35` / `start35` / `stop35` / `bench` / `bench35` / `bench_pcie` / `idle-test` / `litellm-logs` / `litellm-logs35` |
 | `scripts/coding_session_bench.py` | growing coding-session bench against vLLM (prefill/output tps; prefix-cache hit via `/metrics`). Defaults to vLLM (`:8000`) for real hit%; via the proxy (`:4000`) `hit%` reads 0 |
 | `scripts/pcie_bw_bench.py` | GPU↔host PCIe D2H/H2D bandwidth + TP=2 all-reduce estimate |
@@ -735,11 +735,14 @@ that the default strip variant drops.
 #### Drive it with Claude Code
 
 ```bash
-./bin/claude-qwen           # 27B dense stack
-./bin/claude-qwen-moe       # 35B MoE stack
+make start35 && ./bin/claude-qwen                  # 35B MoE stack (default)
+make start   && ./bin/claude-qwen --model dense    # 27B dense stack
 ```
 
-`claude-qwen[-moe]` points Claude Code at the proxy
+`--model {moe|dense}` (default `moe`) picks the Qwen line and must match the
+running stack — start it first (`make start35` MoE / `make start` dense); the two
+stacks share one A10 + host `:4000`, so only one runs at a time and switching
+lines is a manual cold swap, not automatic. `claude-qwen` points Claude Code at the proxy
 (`ANTHROPIC_BASE_URL=http://localhost:4000`, no `/v1`), sends a placeholder
 `ANTHROPIC_AUTH_TOKEN` (the proxy is auth-free; Claude Code just needs one
 non-empty), sets the model to `qwen3.6-27b` / `qwen3.6-35b-a3b` and the
@@ -752,14 +755,18 @@ The host needs the `claude` CLI on `PATH`.
 #### Drive it with opencode
 
 ```bash
-./bin/opencode-qwen         # 27B dense stack
-./bin/opencode-qwen-moe     # 35B MoE stack
+make start35 && ./bin/opencode-qwen                  # 35B MoE stack (default)
+make start   && ./bin/opencode-qwen --model dense    # 27B dense stack
 ```
 
-opencode ignores `OPENAI_BASE_URL` for its built-in `openai` provider, so the
-wrapper hands it a dedicated openai-compatible provider via a **private
-`XDG_CONFIG_HOME`** — a *copy* of `opencode-qwen[-moe].json` from this repo into
-a per-stack cache dir. That isolates the session from your global
+`--model {moe|dense}` (default `moe`) picks the Qwen line and must match the
+running stack — start it first (`make start35` MoE / `make start` dense); the two
+stacks share one A10 + host `:4000`, so only one runs at a time and switching
+lines is a manual cold swap, not automatic. opencode ignores `OPENAI_BASE_URL`
+for its built-in `openai` provider, so the wrapper hands it a dedicated
+openai-compatible provider via a **private `XDG_CONFIG_HOME`** — a *copy* of
+`opencode-qwen.json` (dense) or `opencode-qwen-moe.json` (MoE) from this repo
+into a per-line cache dir. That isolates the session from your global
 `~/.config/opencode/opencode.json` (a copy, not a symlink, so opencode's
 write-backs land on the disposable copy, not the committed file). Pick the model
 with `-m litellm/qwen3.6-27b[-preserve|-nothink]`, or set `QWEN_FLAVOR`; the

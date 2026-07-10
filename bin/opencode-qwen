@@ -1,26 +1,46 @@
 #!/usr/bin/env bash
-# Wrap the `opencode` CLI to drive local Qwen3.6-27B (dense, via the LiteLLM sole
+# Wrap the `opencode` CLI to drive a local Qwen3.6 line (via the LiteLLM sole
 # proxy) as an OpenAI-compatible backend.
 #
 # opencode can't be pointed at a custom endpoint by env alone: it ignores
 # OPENAI_BASE_URL for its built-in `openai` provider. So we hand it a dedicated
 # openai-compatible provider via a PRIVATE XDG_CONFIG_HOME -- a COPY of
-# opencode-qwen.json from this repo. That isolates this session from your global
-# ~/.config/opencode/opencode.json (Kimi/cloud default): no leak to a cloud
+# opencode-qwen{,-moe}.json from this repo. That isolates this session from your
+# global ~/.config/opencode/opencode.json (Kimi/cloud default): no leak to a cloud
 # gateway, no change to plain `opencode`. (A copy, not a symlink, so any write-back
 # opencode does lands on the disposable copy, not the committed file.)
 #
-# Stack  = which wrapper: this one targets the 27B dense stack (make start);
-#          opencode-qwen-moe targets the 35B MoE stack (make start35).
-# Flavor = QWEN_FLAVOR (default | preserve | nothink); empty/default = strip.
-#          Switch mid-session with /model litellm/qwen3.6-27b[-preserve|-nothink].
+# Model   = --model {moe|dense} (default moe). MUST match the running stack:
+#             moe   -> qwen3.6-35b-a3b, opencode-qwen-moe.json (ctx 128k)  (make start35)
+#             dense -> qwen3.6-27b,     opencode-qwen.json     (ctx 64k)   (make start)
+#           One A10 + one host :4000 -> only one stack runs at a time, so switching
+#           lines is a manual cold swap (make stop/start35), NOT automatic. This
+#           wrapper does NOT start the stack -- run the matching `make` target first.
+# Flavor  = QWEN_FLAVOR (default | preserve | nothink); empty/default = strip.
+#           Switch mid-session with /model litellm/qwen3.6-<line>[-preserve|-nothink].
 # The -nothink variant is the config's small_model (background tasks never reason).
 #
 # The proxy is auth-free (0.0.0.0:4000), so apiKey is a placeholder. First run may
 # pull the @ai-sdk/openai-compatible npm provider (one-time).
 set -euo pipefail
 
-BASE="qwen3.6-27b"                       # dense; opencode-qwen-moe uses qwen3.6-35b-a3b
+MODEL="moe"                               # --model {moe|dense}; moe is the default
+rest=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model)    MODEL="${2:?opencode-qwen: --model needs a value}"; shift 2 ;;
+    --model=*)  MODEL="${1#--model=}"; shift ;;
+    *)          rest+=("$1"); shift ;;
+  esac
+done
+
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+case "$MODEL" in
+  moe)   BASE="qwen3.6-35b-a3b"; CONF="$REPO/opencode-qwen-moe.json"; CACHE="opencode-qwen-moe" ;;
+  dense) BASE="qwen3.6-27b";     CONF="$REPO/opencode-qwen.json";     CACHE="opencode-qwen" ;;
+  *) echo "opencode-qwen: --model must be 'moe' or 'dense' (got '$MODEL')" >&2; exit 2 ;;
+esac
+
 case "${QWEN_FLAVOR:-default}" in
   default)  FLAVOR="" ;;
   preserve) FLAVOR="-preserve" ;;
@@ -28,11 +48,8 @@ case "${QWEN_FLAVOR:-default}" in
   *) echo "QWEN_FLAVOR must be one of: default, preserve, nothink" >&2; exit 1 ;;
 esac
 
-REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-CONF="$REPO/opencode-qwen.json"
-
-# Private, per-stack config home so opencode reads OUR provider, not the global one.
-HOME_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/opencode-qwen"
+# Private, per-line config home so opencode reads OUR provider, not the global one.
+HOME_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$CACHE"
 mkdir -p "$HOME_DIR/opencode"
 cp -f "$CONF" "$HOME_DIR/opencode/opencode.json"
 # Remote hosts: override the proxy base (parallels claude-qwen's ANTHROPIC_BASE_URL).
@@ -40,4 +57,4 @@ sed -i "s#http://localhost:4000#${OPENCODE_QWEN_BASE_URL:-http://localhost:4000}
   "$HOME_DIR/opencode/opencode.json"
 export XDG_CONFIG_HOME="$HOME_DIR"
 
-exec opencode -m "litellm/$BASE$FLAVOR" "$@"
+exec opencode -m "litellm/$BASE$FLAVOR" "${rest[@]}"

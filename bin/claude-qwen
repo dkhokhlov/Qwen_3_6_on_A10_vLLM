@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Wrap the `claude` CLI to drive local Qwen3.6-27B (dense, via the LiteLLM sole
-# proxy) as if it were Anthropic. All knobs are env-only; this sets them and
-# execs `claude`.
+# Wrap the `claude` CLI to drive a local Qwen3.6 line (via the LiteLLM sole proxy)
+# as if it were Anthropic. All knobs are env-only EXCEPT --model; this sets them
+# and execs `claude`.
 #
-# Stack  = which wrapper: this one targets the 27B dense stack (make start);
-#          claude-qwen-moe targets the 35B MoE stack (make start35).
-# Flavor = QWEN_FLAVOR (default | preserve | nothink); empty/default = strip.
-#          Switch mid-session with /model qwen3.6-27b[-preserve|-nothink].
+# Model   = --model {moe|dense} (default moe). MUST match the running stack:
+#             moe   -> qwen3.6-35b-a3b  (make start35)
+#             dense -> qwen3.6-27b      (make start)
+#           One A10 + one host :4000 -> only one stack runs at a time, so switching
+#           lines is a manual cold swap (make stop/start35), NOT automatic. This
+#           wrapper does NOT start the stack -- run the matching `make` target first.
+# Flavor  = QWEN_FLAVOR (default | preserve | nothink); empty/default = strip.
+#           Switch mid-session with /model qwen3.6-<line>[-preserve|-nothink].
 # ANTHROPIC_SMALL_FAST_MODEL is always the -nothink variant (bg tasks never reason).
 #
 # The proxy runs auth-free and is bound 0.0.0.0:4000 (LAN-accessible), so the
@@ -20,7 +24,22 @@
 # hatch -- set it to drive a remote box running this proxy instead of localhost.
 set -euo pipefail
 
-BASE="qwen3.6-27b"                       # dense; claude-qwen-moe uses qwen3.6-35b-a3b
+MODEL="moe"                               # --model {moe|dense}; moe is the default
+rest=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model)    MODEL="${2:?claude-qwen: --model needs a value}"; shift 2 ;;
+    --model=*)  MODEL="${1#--model=}"; shift ;;
+    *)          rest+=("$1"); shift ;;
+  esac
+done
+
+case "$MODEL" in
+  moe)   BASE="qwen3.6-35b-a3b" ;;
+  dense) BASE="qwen3.6-27b" ;;
+  *) echo "claude-qwen: --model must be 'moe' or 'dense' (got '$MODEL')" >&2; exit 2 ;;
+esac
+
 case "${QWEN_FLAVOR:-default}" in
   default)  FLAVOR="" ;;
   preserve) FLAVOR="-preserve" ;;
@@ -44,4 +63,9 @@ unset ANTHROPIC_API_KEY CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
 # which would otherwise re-point /model sonnet|opus|haiku away from our models.
 unset ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
 
-exec claude "$@"
+# Disable claude.ai connectors ONLY in this wrapper session; also silences the
+# "claude.ai connectors are disabled because ANTHROPIC_API_KEY..." warning.
+# Value MUST be a falsy sentinel ("false"/"0"/"off") — "true"/"1" re-enables.
+export ENABLE_CLAUDEAI_MCP_SERVERS="false"
+
+exec claude "${rest[@]}"
