@@ -4,7 +4,7 @@ PY      ?= python3
 BENCH   ?= scripts/coding_session_bench.py
 TURNS   ?= 27  # reaches ~64k seq (full context): ~2k input + ~500 output/turn
 
-.PHONY: help run start stop run35 start35 stop35 bench bench35 bench_pcie idle-test litellm-logs litellm-logs35
+.PHONY: help run start stop run35 start35 stop35 clean bench bench35 bench_pcie idle-test litellm-logs litellm-logs35
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -26,6 +26,15 @@ start35: ## Start the 35B MoE stack detached (background)
 
 stop35: ## Stop the 35B MoE stack (containers kept, not removed)
 	docker compose -f docker-compose.moe.yaml stop
+
+clean: ## FULL RESET (destructive): wipe Open WebUI DB + vLLM caches across BOTH stacks
+	@echo "==> Destroying volumes (IRREVERSIBLE): open-webui-data, vllm_cache, vllm_cache_moe"
+	@echo "    open-webui-data holds your admin account + chat history -> gone."
+	-docker compose down -v
+	-docker compose -f docker-compose.moe.yaml down -v
+	@echo "==> Done. Recreate with: make start  (27B)  or  make start35  (35B MoE)"
+	@echo "    First visit to :3000 re-creates the Open WebUI admin account; the model list"
+	@echo "    re-seeds from OPENAI_API_BASE_URL (litellm:4000/v1)."
 
 bench: ## Run the growing coding-session bench (override with TURNS=N)
 	$(PY) $(BENCH) --turns $(TURNS)
