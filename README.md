@@ -24,6 +24,7 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 ## TOC
 
 **Part 1 — Getting Started**
+- [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
 - [Repo structure](#repo-structure)
 - [Security](#security)
@@ -48,6 +49,14 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 - [Two A10 cards — TP=2 projections](#two-a10-cards--tp2-projections-for-dense-and-moe)
 
 ## Part 1 — Getting Started
+
+### Prerequisites
+
+| need | why | install |
+|---|---|---|
+| Docker Engine | runs the vLLM + LiteLLM + open-webui stack | [docs.docker.com/engine/install](https://docs.docker.com/engine/install/) |
+| NVIDIA Container Toolkit | passes the A10 through to the vLLM container | [install guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) |
+| python3 | the coding-session benches and the pytest suite (`make test`) | system python ≥ 3.10; tests add `pip install -r requirements-test.txt` |
 
 ### Quick Start
 
