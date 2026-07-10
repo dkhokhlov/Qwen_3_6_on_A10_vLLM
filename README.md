@@ -1,7 +1,17 @@
 # Running Qwen3.6 on NVIDIA A10 24GB with vLLM
 
-Configs and measurements for both Qwen3.6 checkpoints on a single
-[NVIDIA A10](https://www.techpowerup.com/gpu-specs/a10-pcie.c3793) (24GB) with vLLM:
+[![GPU](https://img.shields.io/badge/GPU-NVIDIA_A10_24GB-blue)](https://www.techpowerup.com/gpu-specs/a10-pcie.c3793)
+[![Qwen3.6](https://img.shields.io/badge/Qwen3.6-27B_Dense-success)](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ)
+[![Qwen3.6](https://img.shields.io/badge/Qwen3.6-35B_MoE-success)](https://huggingface.co/QuantTrio/Qwen3.6-35B-A3B-AWQ)
+[![context](https://img.shields.io/badge/context-64k_and_128k-brightgreen)](#dense-vs-moe--why-the-bigger-model-serves-more-context)
+[![quant](https://img.shields.io/badge/quant-AWQ_INT4-orange)](#awq-quantization--the-method-and-why-both-models-use-it)
+[![license](https://img.shields.io/badge/license-MIT-yellow)](./LICENSE)
+
+Serve the latest [**Qwen3.6**](https://huggingface.co/collections/Qwen/qwen36) — a
+**Dense** model and a **Mixture-of-Experts (MoE)** model, built for **agentic coding**
+and tool use — on a single [NVIDIA A10](https://www.techpowerup.com/gpu-specs/a10-pcie.c3793)
+(24GB) with vLLM. Qwen reports 73–77% on SWE-bench Verified for the two base models.
+Real measured throughput at full context:
 
 - **[Qwen3.6-27B-AWQ](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ) — a
   Dense model** (27B active params, no experts) at full **64k context, no CPU
@@ -15,7 +25,7 @@ Configs and measurements for both Qwen3.6 checkpoints on a single
 hidden dim). The MoE's 35B weights don't fit without offload; the dense 27B fits
 cleanly. See [Dense vs MoE — why the bigger model serves more context](#dense-vs-moe--why-the-bigger-model-serves-more-context).
 
-**Both checkpoints are AWQ-INT4** — activation-aware 4-bit quantization (group
+**Both models are AWQ-INT4** — activation-aware 4-bit quantization (group
 128, asymmetric), not naive round-to-nearest — which is why a 27B and a 35B
 model both fit on 24GB at near-FP16 quality. vLLM's Marlin kernel keeps them
 packed-INT4 through serving, ~3–4× faster to decode than FP16. See
