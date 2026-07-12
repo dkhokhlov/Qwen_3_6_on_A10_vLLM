@@ -2,7 +2,8 @@
 # searxng container by docker-compose.{,moe.}yaml. Enables the JSON output format
 # (LiteLLM's searxng provider queries ?format=json -- JSON is OFF by default for
 # security on public instances) and disables the bot limiter so LiteLLM's programmatic
-# queries aren't blocked. DuckDuckGo is on via use_default_settings.
+# queries aren't blocked. DuckDuckGo (the forgiving workhorse) is on via
+# use_default_settings; Brave is disabled below (it 429s under programmatic load).
 use_default_settings: true
 server:
   bind_address: 0.0.0.0
@@ -13,3 +14,10 @@ server:
 search:
   formats: [html, json]   # JSON is what LiteLLM reads; html kept for the healthcheck + browser
   safe_search: 0
+# Brave (a default engine) 429s under programmatic load (suspended_time=180) and only
+# adds log noise -- DuckDuckGo returns results where Brave gets rate-limited. Disable
+# Brave so SearXNG stops retrying it. Other default engines (Google, Bing, Wikipedia, ...)
+# remain via use_default_settings; this entry merges into the defaults by name.
+engines:
+  - name: brave
+    disabled: true
