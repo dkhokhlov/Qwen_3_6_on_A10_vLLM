@@ -49,8 +49,8 @@ test: ci ## Fast unit + config tests with coverage (no GPU/docker)
 test-integration: ci ## Long integration tests against the LIVE stack (run make start35 first)
 	$(VENV)/bin/python -m pytest tests/integration -m integration -o addopts="" -s
 
-test-all: ci ## Run unit + integration (integration skipped unless the stack is up)
-	$(VENV)/bin/python -m pytest tests
+test-all: ci ## Run unit + integration (integration skipped unless the stack is up; gpu tier is make test-pcie)
+	$(VENV)/bin/python -m pytest tests/unit tests/integration
 
 bench: ## Run the growing coding-session bench (override with TURNS=N)
 	$(PY) $(BENCH) --turns $(TURNS)
