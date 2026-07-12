@@ -1,0 +1,15 @@
+# SearXNG settings for LiteLLM websearch_interception. Mounted read-only into the
+# searxng container by docker-compose.{,moe.}yaml. Enables the JSON output format
+# (LiteLLM's searxng provider queries ?format=json -- JSON is OFF by default for
+# security on public instances) and disables the bot limiter so LiteLLM's programmatic
+# queries aren't blocked. DuckDuckGo is on via use_default_settings.
+use_default_settings: true
+server:
+  bind_address: 0.0.0.0
+  limiter: false          # internal-only; LiteLLM is a trusted programmatic client
+  image_proxy: false
+  public_instance: false
+  secret_key: "21west-qwen-searxng-local-7f3a9c4e1b8d2056a4e7c9f1d2b3a486"  # local session-signing key (not a credential)
+search:
+  formats: [html, json]   # JSON is what LiteLLM reads; html kept for the healthcheck + browser
+  safe_search: 0
