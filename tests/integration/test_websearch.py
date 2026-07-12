@@ -1,14 +1,18 @@
-"""Integration: websearch_interception end-to-end against the LIVE stack.
+"""Integration: websearch_interception wiring smoke-test against the LIVE stack.
 
-Replicates the spike probe that resolved upstream
-[#29649](https://github.com/BerRIAI/litellm/issues/29649): POST /v1/messages with
-Claude Code's native web_search server tool + a time-sensitive question, and assert
-Qwen synthesizes a grounded answer via the agentic loop (a recent year in the text),
-not a raw dump or an error. Guards the server-side search path that replaced the
-client-side DDG MCP.
+POST /v1/messages with Claude Code's native web_search server tool + a time-sensitive
+question; assert the stack accepts the tool, runs a search, and returns current text
+(a recent year). Confirms the server-side search path that replaced the client-side
+DDG MCP is wired up and answering 200.
 
-Skipped unless :4000 answers (autouse guard in conftest) -- run on the box with
-`make start35`, then `make test-integration`."""
+This is a WIRING smoke-test, NOT a faithful [#29649] regression guard: the year
+assertion passes for BOTH a synthesized answer AND a raw SearXNG dump (DDG
+titles/snippets contain years), so it cannot alone distinguish the agentic loop from
+the raw short-circuit. Strengthening it needs a live response capture on the box.
+
+[#29649]: https://github.com/BerRIAI/litellm/issues/29649
+Skipped unless :4000 answers (autouse guard in conftest) -- `make start35`,
+then `make test-integration`."""
 import os
 import re
 
@@ -43,5 +47,6 @@ def test_web_search_synthesizes_a_grounded_answer(litellm_base):
     assert r.status_code == 200, r.text[:500]
     content = r.json().get("content", [])
     text = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
-    # A synthesized grounded answer names a recent year; an empty/raw dump or an error does not.
-    assert re.search(r"202[5-9]", text), f"no recent year in synthesized answer: {text[:300]!r}"
+    # Wiring check: 200 + a recent year. A raw SearXNG dump also contains years, so this
+    # alone does NOT prove synthesis (see docstring); it only confirms the path answers.
+    assert re.search(r"202[5-9]", text), f"no recent year in response: {text[:300]!r}"
