@@ -72,6 +72,28 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # SearXNG: self-hosted meta-search (DuckDuckGo engine) backing LiteLLM's
+  # websearch_interception. Keyless. On the DEFAULT network (needs internet egress to
+  # reach DuckDuckGo -- NOT the internal docker-api net); litellm reaches it as
+  # http://searxng:8080. settings.yml enables the JSON output format LiteLLM queries
+  # (?format=json, off by default) and disables the bot limiter for programmatic access.
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng-qwen35b
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://localhost:8080/' >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
   # LiteLLM sole proxy: Anthropic<->OpenAI translation + three model names
   # (bare/-preserve/-nothink), and owns the vllm lifecycle (wake-on-request,
   # idle-stop). See litellm_config.moe.yaml + litellm_callbacks.py.
@@ -91,6 +113,7 @@ services:
       WAKE_TIMEOUT_SECONDS: "${VLLM_WAKE_TIMEOUT:-300}"
       LITELLM_WORKER_STARTUP_HOOKS: litellm_callbacks:start_background_tasks
       PYTHONPATH: /app
+      SEARXNG_API_BASE: http://searxng:8080   # SearXNG instance for websearch_interception (searxng provider)
     volumes:
       - ./litellm_config.moe.yaml:/app/litellm_config.yaml:ro
       - ./litellm_callbacks.py:/app/litellm_callbacks.py:ro
@@ -100,6 +123,7 @@ services:
       - docker-api   # reach docker-sock-proxy only
     depends_on:
       - docker-sock-proxy
+      - searxng
     healthcheck:
       test: ["CMD-SHELL", "python3 -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:4000/health/liveliness\").status==200 else 1)'"]
       interval: 15s
