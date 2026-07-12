@@ -5,10 +5,16 @@
 # opencode can't be pointed at a custom endpoint by env alone: it ignores
 # OPENAI_BASE_URL for its built-in `openai` provider. So we hand it a dedicated
 # openai-compatible provider via a PRIVATE XDG_CONFIG_HOME -- a COPY of
-# opencode-qwen{,-moe}.json from this repo. That isolates this session from your
-# global ~/.config/opencode/opencode.json (Kimi/cloud default): no leak to a cloud
-# gateway, no change to plain `opencode`. (A copy, not a symlink, so any write-back
-# opencode does lands on the disposable copy, not the committed file.)
+# opencode-qwen{,-moe}.json from this repo. That isolates the *provider* from your
+# global ~/.config/opencode/opencode.json (Kimi/cloud LLM default): the model stays
+# local Qwen via LiteLLM, no cloud LLM gateway, no change to plain `opencode`.
+# (A copy, not a symlink, so any write-back opencode does lands on the disposable
+# copy, not the committed file.) MCP servers are NOT duplicated into the repo
+# config -- the wrapper merges ONLY the `mcp` key from your global
+# ~/.config/opencode/opencode.json into the private copy (single source of truth
+# for MCP). The provider/model stay our local litellm, so the global Kimi/cloud LLM
+# never leaks in; but deepwiki + agentmail ARE remote MCP servers, so provider
+# isolation is NOT network isolation. Delete the merge step to go fully offline.
 #
 # Model   = --model {moe|dense} (default moe). MUST match the running stack:
 #             moe   -> qwen3.6-35b-a3b, opencode-qwen-moe.json (ctx 128k)  (make start35)
@@ -55,6 +61,26 @@ cp -f "$CONF" "$HOME_DIR/opencode/opencode.json"
 # Remote hosts: override the proxy base (parallels claude-qwen's ANTHROPIC_BASE_URL).
 sed -i "s#http://localhost:4000#${OPENCODE_QWEN_BASE_URL:-http://localhost:4000}#g" \
   "$HOME_DIR/opencode/opencode.json"
+# Merge ONLY the `mcp` key from the global ~/.config/opencode/opencode.json into
+# the private copy -- single source of truth for MCP, no duplication in the repo
+# config. The provider/model stay our local litellm; only MCP servers come across.
+GLOBAL_CFG="$HOME/.config/opencode/opencode.json"
+if [[ -f "$GLOBAL_CFG" ]]; then
+  python3 - "$HOME_DIR/opencode/opencode.json" "$GLOBAL_CFG" <<'PY'
+import json, sys
+priv_path, glob_path = sys.argv[1], sys.argv[2]
+try:
+    g = json.load(open(glob_path))
+except Exception:
+    sys.exit(0)  # global config unreadable -> no MCP, proceed without it
+mcp = g.get("mcp")
+if mcp:
+    p = json.load(open(priv_path))
+    p["mcp"] = mcp
+    with open(priv_path, "w") as f:
+        json.dump(p, f, indent=2)
+PY
+fi
 export XDG_CONFIG_HOME="$HOME_DIR"
 
 exec opencode -m "litellm/$BASE$FLAVOR" "${rest[@]}"
