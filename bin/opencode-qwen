@@ -4,17 +4,20 @@
 #
 # opencode can't be pointed at a custom endpoint by env alone: it ignores
 # OPENAI_BASE_URL for its built-in `openai` provider. So we hand it a dedicated
-# openai-compatible provider via a PRIVATE XDG_CONFIG_HOME -- a COPY of
-# opencode-qwen{,-moe}.json from this repo. That isolates the *provider* from your
-# global ~/.config/opencode/opencode.json (Kimi/cloud LLM default): the model stays
-# local Qwen via LiteLLM, no cloud LLM gateway, no change to plain `opencode`.
-# (A copy, not a symlink, so any write-back opencode does lands on the disposable
-# copy, not the committed file.) MCP servers are NOT duplicated into the repo
-# config -- the wrapper merges ONLY the `mcp` key from your global
-# ~/.config/opencode/opencode.json into the private copy (single source of truth
-# for MCP). The provider/model stay our local litellm, so the global Kimi/cloud LLM
-# never leaks in; but deepwiki + agentmail ARE remote MCP servers, so provider
-# isolation is NOT network isolation. Delete the merge step to go fully offline.
+# openai-compatible provider by loading OUR opencode-qwen{,-moe}.json as a
+# project-scope override (OPENCODE_CONFIG) on top of your global
+# ~/.config/opencode/opencode.json. opencode deep-merges both: the GLOBAL config is
+# ALWAYS included (it contributes `mcp` -- codebase-index/deepwiki/agentmail -- and
+# any global settings), and our config overrides `provider`/`model`/`small_model`
+# to the local litellm Qwen line. No copying FROM the global config; opencode does
+# the merge. The provider block stays litellm-only because the global config defines
+# no provider. (Tradeoff vs the old private-XDG_CONFIG_HOME isolation: the global
+# Kimi/cloud model is now switchable in-session via /model, though the default and
+# our -m flag both stay litellm.) To go fully offline, drop `mcp` from your global
+# config or run with --pure.
+#
+# (Our config is copied to a per-line cache file -- not the committed file -- only
+# so the remote-host baseURL sed below doesn't mutate the repo.)
 #
 # Model   = --model {moe|dense} (default moe). MUST match the running stack:
 #             moe   -> qwen3.6-35b-a3b, opencode-qwen-moe.json (ctx 128k)  (make start35)
@@ -54,33 +57,17 @@ case "${QWEN_FLAVOR:-default}" in
   *) echo "QWEN_FLAVOR must be one of: default, preserve, nothink" >&2; exit 1 ;;
 esac
 
-# Private, per-line config home so opencode reads OUR provider, not the global one.
+# Load OUR repo config as a project-scope override (OPENCODE_CONFIG) on top of the
+# global ~/.config/opencode/opencode.json, which opencode deep-merges in. Global is
+# always included (contributes `mcp`); our config overrides provider/model/small_model
+# to local litellm. We copy our config to a per-line cache file only so the baseURL
+# sed below doesn't mutate the committed repo file.
 HOME_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$CACHE"
-mkdir -p "$HOME_DIR/opencode"
-cp -f "$CONF" "$HOME_DIR/opencode/opencode.json"
+mkdir -p "$HOME_DIR"
+cp -f "$CONF" "$HOME_DIR/config.json"
 # Remote hosts: override the proxy base (parallels claude-qwen's ANTHROPIC_BASE_URL).
 sed -i "s#http://localhost:4000#${OPENCODE_QWEN_BASE_URL:-http://localhost:4000}#g" \
-  "$HOME_DIR/opencode/opencode.json"
-# Merge ONLY the `mcp` key from the global ~/.config/opencode/opencode.json into
-# the private copy -- single source of truth for MCP, no duplication in the repo
-# config. The provider/model stay our local litellm; only MCP servers come across.
-GLOBAL_CFG="$HOME/.config/opencode/opencode.json"
-if [[ -f "$GLOBAL_CFG" ]]; then
-  python3 - "$HOME_DIR/opencode/opencode.json" "$GLOBAL_CFG" <<'PY'
-import json, sys
-priv_path, glob_path = sys.argv[1], sys.argv[2]
-try:
-    g = json.load(open(glob_path))
-except Exception:
-    sys.exit(0)  # global config unreadable -> no MCP, proceed without it
-mcp = g.get("mcp")
-if mcp:
-    p = json.load(open(priv_path))
-    p["mcp"] = mcp
-    with open(priv_path, "w") as f:
-        json.dump(p, f, indent=2)
-PY
-fi
-export XDG_CONFIG_HOME="$HOME_DIR"
+  "$HOME_DIR/config.json"
+export OPENCODE_CONFIG="$HOME_DIR/config.json"
 
 exec opencode -m "litellm/$BASE$FLAVOR" "${rest[@]}"
