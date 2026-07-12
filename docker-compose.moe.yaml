@@ -78,7 +78,7 @@ services:
   # http://searxng:8080. settings.yml enables the JSON output format LiteLLM queries
   # (?format=json, off by default) and disables the bot limiter for programmatic access.
   searxng:
-    image: searxng/searxng:latest
+    image: searxng/searxng@sha256:aaf56bb5ad737d48a8a375778d42eb4ab1757231e6b1eb7980e71d8dd5bdf0de   # :latest as of 2026-07-12 (keyless DDG meta-search backing websearch_interception)
     container_name: searxng-qwen35b
     volumes:
       - ./searxng/settings.yml:/etc/searxng/settings.yml:ro

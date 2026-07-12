@@ -161,10 +161,13 @@ def test_litellm_settings_drops_params_and_runs_one_worker(compose_p, litellm_p,
 
 
 @pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
-def test_litellm_settings_has_no_callbacks_string(compose_p, litellm_p, base):
-    # litellm_settings.callbacks:<module.handler> is a SILENT NO-OP: the resolver only
-    # matches built-in integration names. The wake hook must come from the startup hook.
-    assert "callbacks" not in _load(litellm_p)["litellm_settings"]
+def test_litellm_settings_callbacks_are_builtin_names(compose_p, litellm_p, base):
+    # litellm_settings.callbacks:<module.handler> (a DOTTED string) is a SILENT NO-OP:
+    # the resolver only matches BUILT-IN integration names (e.g. "websearch_interception").
+    # The custom wake/idle handler must come from the startup hook, never a dotted string.
+    s = _load(litellm_p)["litellm_settings"]
+    for c in s.get("callbacks", []):
+        assert "." not in c, f"callbacks entry {c!r} looks like a module.handler string (silent no-op)"
 
 
 @pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
@@ -196,6 +199,35 @@ def test_litellm_routes_container_control_through_sock_proxy(compose_p, litellm_
     assert "docker-sock-proxy" in svc.get("depends_on", [])
 
 
+@pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
+def test_websearch_interception_configured(compose_p, litellm_p, base):
+    # Server-side web search needs the built-in callback + a searxng search_tool, gated to
+    # hosted_vllm (Qwen only). Drift here -> WebSearch silently inert again under Qwen.
+    litellm = _load(litellm_p)
+    s = litellm["litellm_settings"]
+    assert "websearch_interception" in s.get("callbacks", []), "websearch_interception missing"
+    assert "hosted_vllm" in s["websearch_interception_params"]["enabled_providers"]
+    tools = litellm.get("search_tools", [])
+    searxng = next((t for t in tools if t["litellm_params"].get("search_provider") == "searxng"), None)
+    assert searxng is not None, "no searxng entry in search_tools"
+    assert searxng["litellm_params"]["api_base"] == "os.environ/SEARXNG_API_BASE"
+
+
+@pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
+def test_searxng_service_wired_to_litellm(compose_p, litellm_p, base):
+    # searxng must be a service litellm depends on + reaches, but NOT on the internal
+    # no-egress docker-api net (it must reach DuckDuckGo). settings.yml mounted read-only.
+    svc = _load(compose_p)["services"]
+    assert "searxng" in svc
+    assert "default" in svc["searxng"].get("networks", [])
+    assert "docker-api" not in svc["searxng"].get("networks", []), \
+        "searxng must not be on the internal no-egress docker-api network"
+    assert svc["litellm"]["environment"]["SEARXNG_API_BASE"] == "http://searxng:8080"
+    assert "searxng" in svc["litellm"].get("depends_on", [])
+    mounts = [str(v) for v in svc["searxng"].get("volumes", [])]
+    assert any("settings.yml" in m and ":ro" in m for m in mounts), mounts
+
+
 # --------------------------------------------------------------------------- #
 # Cross-stack invariants (must be identical across both compose files)
 # --------------------------------------------------------------------------- #
@@ -224,3 +256,12 @@ def test_docker_sock_proxy_allowlist_is_least_privilege():
     assert env["POST"] == "1" and env["ALLOW_START"] == "1" and env["ALLOW_STOP"] == "1"
     assert env["CONTAINERS"] == "0"  # no list/inspect/create/delete
     assert env["EVENTS"] == "0"      # no info leak
+
+
+def test_searxng_image_pinned_by_digest():
+    # Match the repo convention (vllm + docker-sock-proxy): pin by digest so a deploy is
+    # reproducible and a moved :latest tag can't silently change behavior.
+    a, b = _composes()
+    for name, compose in [("dense", a), ("moe", b)]:
+        img = compose["services"]["searxng"]["image"]
+        assert "@sha256:" in img, f"{name}: searxng image must be pinned by digest; got {img!r}"
