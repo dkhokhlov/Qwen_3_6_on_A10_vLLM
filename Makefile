@@ -59,11 +59,13 @@ bench35: ## Bench the 35B MoE stack via vLLM (qwen3.6-35b-a3b; override with TUR
 	$(PY) $(BENCH) --model qwen3.6-35b-a3b --turns $(TURNS)
 
 bench_pcie: ## Measure GPU<->host PCIe bandwidth in the vLLM image (free GPU: `make stop` first)
-	docker run --rm --gpus all --entrypoint python3 -v "$(CURDIR)":/repo -w /repo \
+	$(if $(VLLM_IMAGE),,$(error VLLM_IMAGE not found: expected an 'image: vllm/vllm-openai' line in docker-compose.yaml))
+	docker run --rm --gpus all --entrypoint python3 -v "$(CURDIR)":/repo:ro -w /repo \
 		$(VLLM_IMAGE) scripts/pcie_bw_bench.py
 
 test-pcie: ## Run the pcie unit tests INSIDE the vLLM image (needs GPU; fails without one)
-	docker run --rm --gpus all --entrypoint bash -v "$(CURDIR)":/repo -w /repo \
+	$(if $(VLLM_IMAGE),,$(error VLLM_IMAGE not found: expected an 'image: vllm/vllm-openai' line in docker-compose.yaml))
+	docker run --rm --gpus all --entrypoint bash -v "$(CURDIR)":/repo:ro -w /repo \
 		$(VLLM_IMAGE) -c 'pip install -q pytest pyyaml && python3 -m pytest tests/gpu/test_pcie.py -o addopts="" -p no:cacheprovider'
 
 idle-test: ## (read-only) measure idle/stop/cold-wake power — see PLAN Phase 0
