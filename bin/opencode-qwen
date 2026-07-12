@@ -4,24 +4,27 @@
 #
 # opencode can't be pointed at a custom endpoint by env alone: it ignores
 # OPENAI_BASE_URL for its built-in `openai` provider. So we hand it a dedicated
-# openai-compatible provider by loading OUR opencode-qwen{,-moe}.json as a
-# project-scope override (OPENCODE_CONFIG) on top of your global
-# ~/.config/opencode/opencode.json. opencode deep-merges both: the GLOBAL config is
-# ALWAYS included (it contributes `mcp` -- codebase-index/deepwiki/agentmail -- and
-# any global settings), and our config overrides `provider`/`model`/`small_model`
-# to the local litellm Qwen line. No copying FROM the global config; opencode does
-# the merge. The provider block stays litellm-only because the global config defines
-# no provider. (Tradeoff vs the old private-XDG_CONFIG_HOME isolation: the global
-# Kimi/cloud model is now switchable in-session via /model, though the default and
-# our -m flag both stay litellm.) To go fully offline, drop `mcp` from your global
-# config or run with --pure.
+# openai-compatible provider by passing OUR config as OPENCODE_CONFIG_CONTENT --
+# an inline config string opencode deep-merges as local scope on top of the
+# global ~/.config/opencode/opencode.json. The GLOBAL config is ALWAYS included
+# (it contributes `mcp` -- codebase-index/deepwiki/agentmail -- and any global
+# settings); our inline config overrides `provider`/`model`/`small_model` to the
+# local litellm Qwen line. No copying FROM the global config; opencode does the
+# merge. The provider block is litellm-only because the global config defines no
+# provider. (Tradeoff vs the old private-XDG_CONFIG_HOME isolation: the global
+# Kimi/cloud model is switchable in-session via /model, though the default and
+# our -m flag both stay litellm.) To go fully offline, drop `mcp` from your
+# global config or run with --pure.
 #
-# (Our config is copied to a per-line cache file -- not the committed file -- only
-# so the remote-host baseURL sed below doesn't mutate the repo.)
+# The config is embedded as a static literal in this script -- no sidecar JSON
+# file, no cp/sed, no repo-path lookup -- so the wrapper is self-contained and
+# works unchanged from the ~/bin copy. baseURL uses {env:OPENCODE_QWEN_BASE_URL}
+# interpolation (opencode has no {env:VAR:-default} form, so we export the
+# default ourselves below); set that var to drive a remote box's proxy.
 #
 # Model   = --model {moe|dense} (default moe). MUST match the running stack:
-#             moe   -> qwen3.6-35b-a3b, opencode-qwen-moe.json (ctx 128k)  (make start35)
-#             dense -> qwen3.6-27b,     opencode-qwen.json     (ctx 64k)   (make start)
+#             moe   -> qwen3.6-35b-a3b, 128k ctx  (make start35)
+#             dense -> qwen3.6-27b,     64k ctx   (make start)
 #           One A10 + one host :4000 -> only one stack runs at a time, so switching
 #           lines is a manual cold swap (make stop/start35), NOT automatic. This
 #           wrapper does NOT start the stack -- run the matching `make` target first.
@@ -43,10 +46,84 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# opencode interpolates {env:OPENCODE_QWEN_BASE_URL} in the embedded config's
+# baseURL; it has no default-value syntax, so export the default ourselves.
+# Override to drive a remote box running this proxy instead of localhost.
+export OPENCODE_QWEN_BASE_URL="${OPENCODE_QWEN_BASE_URL:-http://localhost:4000/v1}"
+
+# Embedded provider config (per line), passed as inline local-scope config that
+# opencode merges on top of the global config. Static literals -- no file I/O.
 case "$MODEL" in
-  moe)   BASE="qwen3.6-35b-a3b"; CONF="$REPO/opencode-qwen-moe.json"; CACHE="opencode-qwen-moe" ;;
-  dense) BASE="qwen3.6-27b";     CONF="$REPO/opencode-qwen.json";     CACHE="opencode-qwen" ;;
+  moe)
+    BASE="qwen3.6-35b-a3b"
+    export OPENCODE_CONFIG_CONTENT='{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "litellm/qwen3.6-35b-a3b",
+  "small_model": "litellm/qwen3.6-35b-a3b-nothink",
+  "provider": {
+    "litellm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LiteLLM (local Qwen3.6 35B-A3B MoE)",
+      "options": {
+        "baseURL": "{env:OPENCODE_QWEN_BASE_URL}",
+        "apiKey": "dummy"
+      },
+      "models": {
+        "qwen3.6-35b-a3b": {
+          "name": "Qwen3.6 35B-A3B (strip thinking)",
+          "tool_call": true,
+          "limit": { "context": 128000, "output": 16384 }
+        },
+        "qwen3.6-35b-a3b-preserve": {
+          "name": "Qwen3.6 35B-A3B (preserve thinking)",
+          "tool_call": true,
+          "limit": { "context": 128000, "output": 16384 }
+        },
+        "qwen3.6-35b-a3b-nothink": {
+          "name": "Qwen3.6 35B-A3B (no reasoning)",
+          "tool_call": true,
+          "limit": { "context": 128000, "output": 16384 }
+        }
+      }
+    }
+  }
+}'
+    ;;
+  dense)
+    BASE="qwen3.6-27b"
+    export OPENCODE_CONFIG_CONTENT='{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "litellm/qwen3.6-27b",
+  "small_model": "litellm/qwen3.6-27b-nothink",
+  "provider": {
+    "litellm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LiteLLM (local Qwen3.6 27B dense)",
+      "options": {
+        "baseURL": "{env:OPENCODE_QWEN_BASE_URL}",
+        "apiKey": "dummy"
+      },
+      "models": {
+        "qwen3.6-27b": {
+          "name": "Qwen3.6 27B (strip thinking)",
+          "tool_call": true,
+          "limit": { "context": 64000, "output": 16384 }
+        },
+        "qwen3.6-27b-preserve": {
+          "name": "Qwen3.6 27B (preserve thinking)",
+          "tool_call": true,
+          "limit": { "context": 64000, "output": 16384 }
+        },
+        "qwen3.6-27b-nothink": {
+          "name": "Qwen3.6 27B (no reasoning)",
+          "tool_call": true,
+          "limit": { "context": 64000, "output": 16384 }
+        }
+      }
+    }
+  }
+}'
+    ;;
   *) echo "opencode-qwen: --model must be 'moe' or 'dense' (got '$MODEL')" >&2; exit 2 ;;
 esac
 
@@ -56,18 +133,5 @@ case "${QWEN_FLAVOR:-default}" in
   nothink)  FLAVOR="-nothink" ;;
   *) echo "QWEN_FLAVOR must be one of: default, preserve, nothink" >&2; exit 1 ;;
 esac
-
-# Load OUR repo config as a project-scope override (OPENCODE_CONFIG) on top of the
-# global ~/.config/opencode/opencode.json, which opencode deep-merges in. Global is
-# always included (contributes `mcp`); our config overrides provider/model/small_model
-# to local litellm. We copy our config to a per-line cache file only so the baseURL
-# sed below doesn't mutate the committed repo file.
-HOME_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$CACHE"
-mkdir -p "$HOME_DIR"
-cp -f "$CONF" "$HOME_DIR/config.json"
-# Remote hosts: override the proxy base (parallels claude-qwen's ANTHROPIC_BASE_URL).
-sed -i "s#http://localhost:4000#${OPENCODE_QWEN_BASE_URL:-http://localhost:4000}#g" \
-  "$HOME_DIR/config.json"
-export OPENCODE_CONFIG="$HOME_DIR/config.json"
 
 exec opencode -m "litellm/$BASE$FLAVOR" "${rest[@]}"
