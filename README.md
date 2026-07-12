@@ -66,7 +66,8 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 |---|---|---|
 | Docker Engine | runs the vLLM + [LiteLLM](https://github.com/BerriAI/litellm) + [Open WebUI](https://github.com/open-webui/open-webui) stack | [docs.docker.com/engine/install](https://docs.docker.com/engine/install/) |
 | NVIDIA Container Toolkit | passes the A10 through to the vLLM container | [install guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) |
-| python3 | the coding-session benches and the pytest suite (`make test`) | system python ≥ 3.10; tests add `pip install -r requirements-test.txt` |
+| [uv](https://docs.astral.sh/uv/) | bootstraps an isolated `.venv` for the pytest suite — `make test` runs `make ci` (`uv venv` + install `requirements-test.txt`) on first use; nothing is installed in `$HOME` | [install uv](https://docs.astral.sh/uv/getting-started/installation/) |
+| python3 | the coding-session benches (`make bench`) | system python ≥ 3.10 |
 
 ### Quick Start
 
@@ -114,9 +115,9 @@ TPS, and prefix-cache hit %. Cache hit is read from vLLM `/metrics` (at the
 | `bin/claude-qwen` | Claude Code wrapper: `--model {moe|dense}` (default moe), sets `ANTHROPIC_*` env, execs `claude` against the proxy |
 | `bin/opencode-qwen` | opencode wrapper: `--model {moe|dense}` (default moe), private `XDG_CONFIG_HOME` pointing at our provider |
 | `opencode-qwen.json` / `-moe.json` | opencode provider config the wrapper copies from (baseURL, model limits; 64k dense / 128k MoE) |
-| `Makefile` | `run` / `start` / `stop` / `run35` / `start35` / `stop35` / `bench` / `bench35` / `bench_pcie` / `idle-test` / `litellm-logs` / `litellm-logs35` |
+| `Makefile` | `run` / `start` / `stop` / `run35` / `start35` / `stop35` / `ci` / `test` / `test-integration` / `test-pcie` / `bench` / `bench35` / `bench_pcie` / `idle-test` / `litellm-logs` / `litellm-logs35` |
 | `scripts/coding_session_bench.py` | growing coding-session bench against vLLM (prefill/output tps; prefix-cache hit via `/metrics`). Defaults to vLLM (`:8000`) for real hit%; via the proxy (`:4000`) `hit%` reads 0 |
-| `scripts/pcie_bw_bench.py` | GPU↔host PCIe D2H/H2D bandwidth + TP=2 all-reduce estimate |
+| `scripts/pcie_bw_bench.py` | GPU↔host PCIe D2H/H2D bandwidth + TP=2 all-reduce estimate (in-container via `make bench_pcie` / `make test-pcie`) |
 
 ### Security
 
@@ -611,7 +612,7 @@ feature. (FP8 *KV* via FlashInfer works on Ampere and is used here.)
 ### Idle power-down — the LiteLLM sole proxy
 
 Both stacks put **LiteLLM** (`ghcr.io/berriai/litellm:main-stable`) in front of
-vLLM as the single host-facing service on `0.0.0.0:4000`. It owns three things:
+vLLM as the single host-facing service on `0.0.0.0:4000`. It owns four things:
 
 1. **Translation** — Anthropic `/v1/messages` ↔ OpenAI `/v1/chat/completions`, so
    Claude Code drives local Qwen3.6 as if it were Anthropic and opencode drives
@@ -622,6 +623,10 @@ vLLM as the single host-facing service on `0.0.0.0:4000`. It owns three things:
    `chat_template_kwargs` (see *Thinking*); switchable via `/model`.
 3. **The vLLM lifecycle** — a custom callback (`litellm_callbacks.py`) wakes
    the backend on request and `docker stop`s it after 15 min of inference-idle.
+4. **Web search** — LiteLLM's `websearch_interception` converts Claude Code's
+   native `web_search` tool to a SearXNG (DuckDuckGo) lookup and feeds the
+   result back for Qwen to synthesize, so WebSearch works under Qwen with no
+   client setup (see *Web search*).
 
 **Goal, met: after 15 min idle the A10 draws ~15 W (< 50 W target).**
 
@@ -659,6 +664,34 @@ the proxy. LiteLLM still reaches vLLM over the compose network at
 (`http://localhost:8000`) so its `hit%` is real; `bin/claude-qwen` /
 `bin/opencode-qwen` hit the proxy (`http://localhost:4000`). Remote hosts hit the box's LAN IP (override
 `ANTHROPIC_BASE_URL` / `OPENAI_API_BASE_URL`).
+
+**Service topology** (dense; the MoE stack is the same shape, different model and
+container names). `litellm` is the hub — the only service on both networks:
+
+```
+                      LAN
+                       |   :4000 litellm  ·  :3000 open-webui  ·  :8000 vllm (metrics/bench)
+                       v
+                  +----------+
+                  | litellm  | :4000  -- the hub (only service on BOTH networks):
+                  | (hub)    |        translate + wake/idle lifecycle + websearch_interception
+                  +----+-----+
+       infer /v1/chat  |        | web_search tool -> SearXNG
+        +-------------+        +--------------+
+        v                                     v
+   +----------+                         +------------+   HTTPS   +------------+
+   |  vllm    |                         |  searxng   |  ------>  | DuckDuckGo |
+   | :8000 GPU|                         |   :8080    |           | (internet) |
+   +----------+                         +------------+           +------------+
+
+   open-webui :3000  (browser chat UI)  -->  litellm:4000/v1
+
+   docker-api network (INTERNAL, no egress):
+       litellm  --Engine API-->  docker-sock-proxy :2375  -->  /var/run/docker.sock
+                                (HAProxy whitelist: POST /containers/{id}/{start,stop} + GET /_ping only)
+
+   default network (bridge, HAS egress): litellm + vllm + open-webui + searxng.
+```
 
 #### Endpoints
 
@@ -731,6 +764,35 @@ normalizes `thinking_blocks`/`reasoning` → `reasoning_content` on prior assist
 turns before vLLM renders them. Verified on `/v1/messages` (the Claude Code path):
 a 2-turn `-preserve` request carries ~44 extra prompt tokens of prior reasoning
 that the default strip variant drops.
+
+#### Web search
+
+Under the Qwen stack WebSearch would be inert — it is an Anthropic server-side
+tool that does nothing against a custom base URL — so LiteLLM's built-in
+`websearch_interception` callback runs it **server-side**: it converts Claude
+Code's native `web_search` tool to `litellm_web_search`, runs the lookup through
+a self-hosted **SearXNG** instance (DuckDuckGo engine, **no API key**), feeds the
+results back, and Qwen synthesizes a grounded answer with citations. The client
+needs **no change** — `bin/claude-qwen` is plain `claude` with the Qwen env (no
+MCP server, no `--disallowedTools`).
+
+Real Claude Code requests carry `web_search` *alongside* their other tools (Read,
+Bash, …), so they take LiteLLM's **agentic loop**: Qwen calls the search tool,
+SearXNG runs, results return, Qwen synthesizes. That is why this works despite
+upstream [litellm#29649](https://github.com/BerRIAI/litellm/issues/29649), whose
+raw-results short-circuit fires only for web-search-*only* requests — a shape
+Claude Code never sends. Verified end-to-end: a time-sensitive question returns a
+synthesized answer citing a source URL.
+
+Config (`litellm_config.yaml` / `.moe.yaml`, both stacks): `callbacks:
+[websearch_interception]` gated to the Qwen proxy by
+`websearch_interception_params.enabled_providers: [hosted_vllm]` (the owner's
+real `claude` → Anthropic never hits this proxy), plus a `search_tools` SearXNG
+entry reading `SEARXNG_API_BASE`. The `searxng` compose service sits on the
+**default** network (it needs internet egress to reach DuckDuckGo — *not* the
+internal no-egress `docker-api` net); `searxng/settings.yml` enables the JSON
+output format LiteLLM queries and disables the bot limiter. Needs LiteLLM
+≥ v1.78.7 (`main-stable` is well past it).
 
 #### Drive it with Claude Code
 
@@ -969,7 +1031,7 @@ param-bound). Do not retry without reason.
 
 ### PCIe bandwidth — grounding the TP=2-on-x4 question
 
-`make bench_pcie` (`scripts/pcie_bw_bench.py`) measures GPU↔host cudaMemcpy
+`make bench_pcie` (`scripts/pcie_bw_bench.py`, run inside the vLLM image so the host needs no torch) measures GPU↔host cudaMemcpy
 bandwidth and bounds the TP=2 all-reduce cost on the x4 link. A10 negotiates
 **Gen4 x4**; measured steady-state (large payloads, pinned + non_blocking):
 

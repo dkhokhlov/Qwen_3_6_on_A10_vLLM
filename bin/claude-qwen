@@ -50,8 +50,9 @@ esac
 export ANTHROPIC_BASE_URL="${CLAUDE_QWEN_BASE_URL:-http://localhost:4000}"   # NO /v1
 export ANTHROPIC_AUTH_TOKEN="sk-claude-qwen-local"                           # placeholder (auth off)
 export ANTHROPIC_MODEL="$BASE$FLAVOR"                                        # default = strip
-export ANTHROPIC_SMALL_FAST_MODEL="$BASE-nothink"                           # bg: no reasoning
-export CLAUDE_MODEL="$BASE$FLAVOR"   # /home/owner/bin/claude reads this -> --model
+export ANTHROPIC_SMALL_FAST_MODEL="$BASE-nothink"                            # bg: no reasoning
+export CLAUDE_MODEL="$BASE$FLAVOR"   # the 'claude' on PATH reads this -> --model
+export CLAUDE_CODE_SUBAGENT_MODEL="$BASE-nothink"
 
 # Let the /model picker list all three flavors; cut telemetry noise.
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
@@ -68,4 +69,10 @@ unset ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFA
 # Value MUST be a falsy sentinel ("false"/"0"/"off") — "true"/"1" re-enables.
 export ENABLE_CLAUDEAI_MCP_SERVERS="false"
 
+# Web search is handled SERVER-SIDE, not in this wrapper: LiteLLM's
+# websearch_interception callback converts claude's native web_search tool to
+# litellm_web_search, runs it via SearXNG (DuckDuckGo), and Qwen synthesizes a
+# grounded answer -- so plain `claude` with these Qwen env vars is all that's
+# needed (no client-side MCP, no --disallowedTools). See litellm_config.yaml
+# (callbacks + search_tools) + the searxng compose service.
 exec claude "${rest[@]}"

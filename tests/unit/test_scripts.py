@@ -1,5 +1,8 @@
-"""Unit tests for the pure helpers in the two benchmark scripts. Loads each script by
-file path (they aren't packages) and exercises only the no-network / no-GPU functions."""
+"""Unit tests for the pure helpers in coding_session_bench. Loads the script by file
+path (it isn't a package) and exercises only the no-network / no-GPU functions.
+
+The pcie_bw_bench helpers live in tests/gpu/ (run inside the vLLM image via
+`make test-pcie`): that script imports torch, which has no place in this hermetic suite."""
 import importlib.util
 from pathlib import Path
 
@@ -17,7 +20,6 @@ def _load_module(rel_path: str, name: str):
 
 
 csb = _load_module("scripts/coding_session_bench.py", "coding_session_bench")
-pcie = _load_module("scripts/pcie_bw_bench.py", "pcie_bw_bench")
 
 
 # --------------------------------------------------------------------------- #
@@ -92,18 +94,3 @@ def test_get_cache_counters_failure_returns_none_pair(monkeypatch):
 
     monkeypatch.setattr(csb.requests, "get", boom)
     assert csb.get_cache_counters("http://h:8000/v1", 5) == (None, None)
-
-
-# --------------------------------------------------------------------------- #
-# pcie_bw_bench.fmt_gbs + bw_at: pure formatter + closest-payload picker
-# --------------------------------------------------------------------------- #
-def test_fmt_gbs():
-    assert pcie.fmt_gbs(1e9) == "1.00 GB/s"
-    assert pcie.fmt_gbs(1.5e9) == "1.50 GB/s"
-
-
-def test_bw_at_picks_closest_by_log_size():
-    table = {1000: 1.0, 1_000_000: 2.0}
-    bw, size = pcie.bw_at(700_000, table)  # log(700k) ~ 13.5, closer to 1e6 (13.8) than 1e3 (6.9)
-    assert size == 1_000_000
-    assert bw == 2.0
