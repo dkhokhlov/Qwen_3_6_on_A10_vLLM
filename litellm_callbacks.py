@@ -625,6 +625,17 @@ class Handler(CustomLogger):
                     log.info("injected input_tokens=%d into message_start call_id=%s",
                              count, str(cid)[:8])
             yield chunk
+        if not injected:
+            # The preflight stashed a count (preflight succeeded, the POST was about to
+            # go out) yet no message_start frame was ever seen/rewritten -- the count was
+            # dropped on the floor, so message_start.usage.input_tokens stays 0 and
+            # claude's auto-compact tracker never grows. This is the exact silent
+            # regression the injection exists to prevent; surface it as a grep-able
+            # WARNING (chunk-shape drift, stream error before message_start, empty stream).
+            log.warning(
+                "preflight input_tokens=%d stashed but no message_start frame seen -> "
+                "input_tokens NOT injected (auto-compact tracker will not grow) call_id=%s",
+                count, str(cid)[:8])
 
     # Logging-path hook (read-only -- we do NOT mutate here; mutation is the iterator
     # hook's job). Fires AFTER provider_config.transform_request (llm_http_handler.py:461)

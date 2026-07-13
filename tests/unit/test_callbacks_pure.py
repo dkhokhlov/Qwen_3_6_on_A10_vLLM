@@ -406,6 +406,50 @@ async def test_iterator_hook_no_stash_passes_through():
     assert out[0] == chunk                # unchanged when no stash entry
 
 
+async def test_iterator_hook_warns_when_stash_set_but_no_message_start(caplog):
+    # Silent-failure observability (M3): if the preflight stashed a count but the stream
+    # never yields a message_start frame (chunk-shape drift / stream error / empty stream),
+    # the count is dropped and auto-compact never fires -- the exact regression the
+    # injection exists to prevent. The hook must emit a WARNING naming the dropped count
+    # so the failure is grep-able, not silent.
+    import logging
+    h = L.Handler()
+    cid = "call-warn"
+    L._USAGE_INJECT[cid] = 538
+    # A stream with NO message_start -- only a content_block_delta.
+    chunks = [b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"hi"}}\n\n']
+    out = []
+    with caplog.at_level(logging.WARNING, logger=L.log.name):
+        async for c in h.async_post_call_streaming_iterator_hook(None, _agen(chunks), {"litellm_call_id": cid}):
+            out.append(c)
+    assert cid not in L._USAGE_INJECT      # stash still popped (success or not)
+    assert out == chunks                    # chunk passed through unrewritten
+    assert any("NOT injected" in r.message and "538" in r.message for r in caplog.records), (
+        "expected a WARNING that the stashed count was NOT injected"
+    )
+
+
+async def test_iterator_hook_no_warning_on_successful_injection(caplog):
+    # Success path must NOT warn: a real message_start is rewritten, the info log fires,
+    # and no "NOT injected" WARNING appears.
+    import logging
+    h = L.Handler()
+    cid = "call-ok"
+    L._USAGE_INJECT[cid] = 538
+    chunks = [
+        b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":0}}}\n\n',
+        b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"hi"}}\n\n',
+    ]
+    out = []
+    with caplog.at_level(logging.WARNING, logger=L.log.name):
+        async for c in h.async_post_call_streaming_iterator_hook(None, _agen(chunks), {"litellm_call_id": cid}):
+            out.append(c)
+    assert b'"input_tokens": 538' in out[0]
+    assert not any("NOT injected" in r.message for r in caplog.records), (
+        "no WARNING expected on successful injection"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Handler.async_pre_request_hook: opt-in proxy-side compaction (compact_20260112)
 # injection on the /v1/messages pass-through path. Off (default) -> None, no
