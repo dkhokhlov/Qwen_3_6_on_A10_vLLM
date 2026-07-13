@@ -212,6 +212,26 @@ def test_context_management_summary_model_present(compose_p, litellm_p, base):
 
 
 @pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
+def test_context_management_summary_max_tokens_per_stack(compose_p, litellm_p, base):
+    # The polyfill's summary-sub-call max_tokens is overridable via
+    # general_settings.context_management_summary_max_tokens (default 4096; read at
+    # compact.py _read_summary_max_tokens_setting). Dense overrides to 2048: its 64k
+    # window is tight (trigger 50000; 50k + 4096 leaves only ~10k, and a single big turn
+    # landing high in the 50k-64k band overflows the sub-call). 2048 buys ~2k of headroom
+    # for that edge case. MoE leaves it UNSET (default 4096): its 128k window has 34k+ of
+    # margin, so no override is needed.
+    gs = _load(litellm_p).get("general_settings", {})
+    smmt = gs.get("context_management_summary_max_tokens")
+    if base == "qwen3.6-27b":                       # dense
+        assert smmt == 2048, f"dense must override summary max_tokens to 2048, got {smmt!r}"
+    else:                                            # moe
+        assert smmt is None, (
+            f"moe must leave context_management_summary_max_tokens unset (default 4096), "
+            f"got {smmt!r}"
+        )
+
+
+@pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
 def test_proxy_compact_env_present_and_off(compose_p, litellm_p, base):
     # CLAUDE_QWEN_PROXY_COMPACT gates the opt-in proxy-side compaction injection. Default
     # "0" (off): claude's own auto-compact handles the first crossing; the polyfill is for

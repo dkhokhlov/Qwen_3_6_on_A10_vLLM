@@ -83,6 +83,15 @@ general_settings:
   # acompletion, a different path, so no polyfill recursion. See litellm_callbacks.py
   # (CLAUDE_QWEN_PROXY_COMPACT) + the async_pre_request_hook that injects context_management.
   context_management_summary_model: qwen3.6-27b-nothink
+  # Override the polyfill's summary-sub-call max_tokens (default 4096) for the dense
+  # stack's tight 64k window. The summary sub-call must fit: history_at_fire +
+  # summary_max_tokens < --max-model-len (64k here). At the 50000 trigger, 50k + 4096
+  # = 54k < 64k is safe for gradual growth, but a single big turn landing input near
+  # the top of the 50k-64k band would overflow (history + 4096 > 64k). 2048 moves the
+  # overflow point up by ~2k (50k + 2048 = 52k) -- a small but real gain for the
+  # single-big-turn edge case, at the cost of shorter (still adequate) summaries.
+  # MoE leaves this unset (default 4096): its 128k window has 34k+ of margin.
+  context_management_summary_max_tokens: 2048
 
 # Search backend for websearch_interception: self-hosted SearXNG (DuckDuckGo engine),
 # keyless. SEARXNG_API_BASE is set on the litellm compose service (http://searxng:8080).
