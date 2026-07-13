@@ -129,9 +129,12 @@ PROXY_COMPACT = os.environ.get(
     "CLAUDE_QWEN_PROXY_COMPACT", "0"
 ).strip().lower() in ("1", "true", "yes", "on")
 # input-token trigger; polyfill requires >= 50000 (else AnthropicContextManagementError
-# 400). 90000 default: below claude's T4 (~98616) so the polyfill fires first/repeats,
-# with headroom for the summarization sub-call to fit (90k + ~16k + ~1k < 128k).
-PROXY_COMPACT_THRESHOLD = int(os.environ.get("CLAUDE_QWEN_PROXY_COMPACT_THRESHOLD", "90000"))
+# 400). 50000 code default (the polyfill minimum): both-stacks-safe -- dense 50k + 4096
+# summarization sub-call + prompt ~= 54k < --max-model-len 64k; MoE just fires more
+# aggressively (still < claude's T4 ~98616, so the polyfill fires first/repeats). The
+# compose envs override this with tuned per-stack values (90000 MoE / 50000 dense) that
+# leave more MoE headroom; this code default is the fallback when the env is unset.
+PROXY_COMPACT_THRESHOLD = int(os.environ.get("CLAUDE_QWEN_PROXY_COMPACT_THRESHOLD", "50000"))
 # litellm_call_id -> preflight input-token count. Set in async_pre_call_deployment_hook,
 # consumed+popped in async_post_call_streaming_iterator_hook. litellm_call_id is the same
 # value at both hooks (self.data flows to kwargs and to request_data -- see plan).
