@@ -1169,9 +1169,11 @@ trigger, call a separate summarizer model with the full history + a summarizatio
 then inject the summary as a system prefix and strip the old messages — all before the
 main call reaches vLLM. The `async_pre_request_hook` in `litellm_callbacks.py` injects
 the `context_management` spec on the `/v1/messages` pass-through path when the opt-in env
-is on. Because the rewrite happens before our `log_pre_api_call` `/tokenize` preflight,
-the injected `message_start.usage.input_tokens` reflects the **post-compact** count, so
-claude's tracker resets each cycle — the same mechanism as outcome A, repeated.
+is on, and **also sets a per-request `drop_params=false`** (see below) to un-gate the
+polyfill for that call only. Because the rewrite happens before our `log_pre_api_call`
+`/tokenize` preflight, the injected `message_start.usage.input_tokens` reflects the
+**post-compact** count, so claude's tracker resets each cycle — the same mechanism as
+outcome A, repeated.
 
 **Opt-in env (litellm service, `docker-compose.{,moe.}yaml`):**
 
@@ -1191,20 +1193,37 @@ default behavior; this layer is for workloads that need repeats.
   HTTP error, a footgun). Set to `qwen3.6-35b-a3b-nothink` (MoE) / `qwen3.6-27b-nothink`
   (dense): a cheap summarizer already in `model_list`. The summary call is a router
   `acompletion` on a different path, so it does not recurse into the polyfill.
-- `litellm_settings.drop_params: false`. `drop_params: true` (the previous setting, which
-  drops claude-code params vLLM rejects to avoid 400s) **short-circuits the polyfill to
-  no-op** — the polyfill gate reads `effective_drop_params` and bails. Flipping to
-  `false` un-gates it. Verified safe on a real `claude -p` request (full ~28K-token tools
-  schema + thinking + `cache_control` + `top_k` + `stop_sequences` + beta headers → 200,
-  no 400): LiteLLM's anthropic→openAI conversion handles everything, so no
-  `additional_drop_params` list is needed. The config-consistency test guards this.
+- `litellm_settings.drop_params: true` (the global default) stays **true** — it keeps
+  dropping claude-code params vLLM rejects to avoid 400s for **every** request. The
+  polyfill is un-gated **per-request** instead: `async_pre_request_hook` sets a top-level
+  `drop_params=false` on the opt-in `/v1/messages` call, which overrides the global
+  `true` for that one call only. Why per-request, not global `false`: the polyfill gate
+  reads `effective_drop_params` and short-circuits to no-op when truthy, so it must see
+  `false` to run — but global `false` would remove the 400 shield for all non-opt-in
+  traffic. The per-request key must be **top-level** in the hook's returned
+  `request_kwargs`: the hook's `litellm_params` sub-dict is popped and discarded
+  (`messages/handler.py:261`), so a sub-dict key would never reach the gate; top-level
+  survives the named pops, merges via `kwargs.update` → `GenericLiteLLMParams(**kwargs)`
+  → `litellm_params.drop_params` (read at `messages/handler.py:503`) and overrides the
+  global the router set. Verified live (A/B): global `true` alone strips
+  `context_management` to null (polyfill no-op); adding the per-request `false` makes the
+  polyfill fire — `applied_edits[0]` is a `compact_20260112` edit with a real
+  summarization sub-call. The config-consistency test guards the global `true`; the hook
+  unit test guards the per-request `false`.
 
-**Verified.** A clean isolation probe (`WINDOW=1000000` so claude's own T4 threshold is
-unreachable — only the polyfill can fire; `~18K`-token user turns, 12 turns) produced
-**two** repeated proxy-side compactions (turn 5: 95196→48556; turn 9: 93160→48635), each
-with a vLLM summarization burst, `compact=False` throughout (transparent), no 400, no
-timeout. claude's tracker reset at each cycle. This is the behavior claude's own
-auto-compact cannot provide (one fire per session).
+**Verified.** The multi-turn reduction shape was established under the prior global
+`drop_params: false` config: a clean isolation probe (`WINDOW=1000000` so claude's own T4
+threshold is unreachable — only the polyfill can fire; `~18K`-token user turns, 12 turns)
+produced **two** repeated proxy-side compactions (turn 5: 95196→48556; turn 9: 93160→48635),
+each with a vLLM summarization burst, `compact=False` throughout (transparent), no 400, no
+timeout, claude's tracker resetting each cycle. The H1 change (global `true` + per-request
+`false` in the hook) only swaps the un-gating mechanism; the polyfill logic is unchanged.
+A single-shot live check under the H1 config confirms the new mechanism un-gates the
+polyfill: a ~60K-token `/v1/messages` request returns
+`context_management.applied_edits[0]` = `compact_20260112` with a real summarization
+sub-call (`summary_input_tokens: 60116`, `summary_output_tokens: 86`) — the inverse of
+global-`true`-alone, which strips `context_management` to null. This is the behavior
+claude's own auto-compact cannot provide (one fire per session).
 
 **Known limitation — summarization sub-call headroom.** The polyfill's summarization
 sub-call requests a hardcoded `max_tokens=4096` **on top of** the full history. So the

@@ -188,13 +188,13 @@ def test_vllm_and_litellm_publish_on_all_interfaces(compose_p, litellm_p, base):
 @pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
 def test_litellm_settings_ungates_polyfill_and_runs_one_worker(compose_p, litellm_p, base):
     s = _load(litellm_p)["litellm_settings"]
-    # drop_params MUST be false: the compact_20260112 polyfill (plan B proxy-side
-    # compaction) short-circuits to no-op when drop_params is truthy. Safe -- litellm's
-    # anthropic->openai conversion handles every claude-code param (verified live: real
-    # `claude -p` with the ~28k-token tools schema -> 200, no 400); the polyfill only RUNS
-    # when `context_management` is present (the opt-in injection), so un-gating is
-    # harmless for non-opt-in traffic.
-    assert s["drop_params"] is False
+    # drop_params stays TRUE globally: it keeps dropping vLLM-rejected claude-code
+    # params for ALL requests (-> no 400s). The compact_20260112 polyfill is un-gated
+    # PER-REQUEST instead -- async_pre_request_hook sets a top-level drop_params=False
+    # on the opt-in /v1/messages call (overriding this global). Global true + per-request
+    # false (verified live A/B) keeps the 400 shield for every other request AND lets the
+    # polyfill fire on opt-in traffic.
+    assert s["drop_params"] is True
     assert s["num_workers"] == 1      # one idle-watcher, one wake-lock owner
 
 

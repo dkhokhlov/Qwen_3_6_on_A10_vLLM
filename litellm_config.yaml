@@ -58,7 +58,7 @@ litellm_settings:
   # No master_key -> auth is OFF and :4000 is bound 0.0.0.0, so any network host
   # can call the proxy (operator's explicit choice; see README Security).
   # open-webui and the bench need no API key; Claude Code sends a placeholder token.
-  drop_params: false                      # un-gate the compact_20260112 polyfill (it short-circuits to no-op when drop_params is truthy). Safe: litellm's anthropic->openai conversion handles every claude-code param (verified live on the moe stack; same conversion path here). The polyfill only RUNS when `context_management` is present (the opt-in injection in litellm_callbacks.async_pre_request_hook), so un-gating is harmless for non-opt-in traffic.
+  drop_params: true                       # keep dropping vLLM-rejected claude-code params (-> no 400s) for ALL requests. The compact_20260112 polyfill is un-gated PER-REQUEST instead: litellm_callbacks.async_pre_request_hook sets a top-level drop_params=False on the opt-in /v1/messages call (overriding this global), so the polyfill runs only when context_management is injected. Same conversion path as the moe stack; global true + per-request false (verified live A/B on moe) keeps the 400 shield for every other request AND lets the polyfill fire on opt-in traffic.
   request_timeout: 600                    # generous; cold wake happens in the middleware
   num_workers: 1                          # one idle-watcher, one wake-lock owner
   # WebSearch interception (built-in callback; needs LiteLLM >= v1.78.7). Server-side:
