@@ -35,6 +35,7 @@ uses plain importlib.import_module, so the compose service sets PYTHONPATH=/app.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -72,6 +73,36 @@ DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 # so clamping here covers every request regardless of what the client sent. Per-stack
 # via compose env (moe=16384, dense=8192); must satisfy PCT*WINDOW + cap <= WINDOW.
 MAX_TOKENS_CAP = int(os.environ.get("CLAUDE_QWEN_MAX_TOKENS_CAP", "16384"))
+
+# Inject the real prompt token count into the streamed message_start.usage.input_tokens
+# so Claude Code's auto-compact tracker grows and fires. The tracker reads the STREAMED
+# message_start usage (NOT the terminal result usage); LiteLLM hardcodes that field to 0
+# (the real count arrives only in the terminal message_delta), so on the Qwen stack the
+# tracker stays at 0 and compaction NEVER fires -- context grows unbounded to a 400
+# (confirmed: an in-process probe reached result.usage.input_tokens=115152 at
+# WINDOW=40000/trigger=32000 with zero compact_boundary events). The ~/bin/glm wrapper
+# works because z.ai reports message_start usage correctly (fires ~70%). Fix: preflight
+# vLLM POST /tokenize (chat-template-applied token count) and inject that count into the
+# first message_start chunk. Gated to the /v1/messages streaming path; no-op everywhere
+# else. See _preflight_input_tokens + async_post_call_streaming_iterator_hook.
+#
+# ACCURACY CAVEAT (unresolved as of this checkpoint): /tokenize matches vLLM's real
+# prompt_tokens EXACTLY for messages-only and for tools sent DIRECT to vLLM, but
+# UNDERCOUNTS on the /v1/messages path when the request carries tools: LiteLLM injects a
+# tool-rendering system prompt (proportional to the tools schema, ~20% of its token count)
+# AFTER the deployment hook, so the hook sees pre-injection kwargs. For real claude-code
+# (~28k-token fixed tools schema) the offset is ~5800 tokens -- large enough to push the
+# dense stack past its safety margin (trigger 51200, overflow >55808). The no-tools path
+# is exact and compaction fires correctly there; the tools path fires LATE. Needs the
+# injection replicated in the preflight, a later hook, or a pivot to LiteLLM
+# context_management. See plan + git history for the decisive direct-vs-proxy test.
+INJECT_STREAMED_USAGE = os.environ.get(
+    "CLAUDE_QWEN_INJECT_STREAMED_USAGE", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+# litellm_call_id -> preflight input-token count. Set in async_pre_call_deployment_hook,
+# consumed+popped in async_post_call_streaming_iterator_hook. litellm_call_id is the same
+# value at both hooks (self.data flows to kwargs and to request_data -- see plan).
+_USAGE_INJECT: dict[str, int] = {}
 
 
 def _metric(line: str) -> int:
@@ -144,6 +175,144 @@ def _clamp_max_tokens(kwargs: dict) -> bool:
             kwargs[key] = MAX_TOKENS_CAP
             changed = True
     return changed
+
+
+def _resolve_served_model(kwargs: dict) -> str | None:
+    """vLLM /tokenize needs the served-model-name (qwen3.6-35b-a3b), NOT the litellm
+    deployment id (hosted_vllm/qwen3.6-35b-a3b) nor a client alias (-preserve/-nothink,
+    which vLLM does not register -> 404). kwargs["model"] at the deployment hook is
+    usually the alias (no '/') but can be the deployment id; the litellm deployment env
+    is the single vLLM model for this stack. Strip the provider prefix from whichever
+    carries it. Returns None only if neither source is set (preflight skipped)."""
+    m = kwargs.get("model")
+    if isinstance(m, str) and "/" in m:
+        return m.split("/", 1)[1]
+    mm = os.environ.get("LITELLM_VLLM_MODEL", "").strip()
+    if "/" in mm:
+        return mm.split("/", 1)[1]
+    return mm or None
+
+
+def _chat_template_kwargs(kwargs: dict) -> dict | None:
+    """The chat_template_kwargs the chosen alias sends to vLLM (enable_thinking /
+    preserve_thinking). These change the chat-template render and thus the token
+    count, so /tokenize must receive the same kwargs the generation uses (verified:
+    nothink=18 vs thinking-on=16 for one message)."""
+    eb = kwargs.get("extra_body")
+    ctk = eb.get("chat_template_kwargs") if isinstance(eb, dict) else None
+    return ctk if isinstance(ctk, dict) else None
+
+
+async def _preflight_input_tokens(
+    *, client, model: str, messages: list, tools=None, chat_template_kwargs=None
+) -> int | None:
+    """Chat-template-applied prompt token count via vLLM POST /tokenize. Equals vLLM's
+    upcoming prompt_tokens EXACTLY when tokenizing the SAME payload vLLM receives
+    (verified live direct-to-vLLM, incl. a ~19k-char tools schema: 4997==4997). On the
+    /v1/messages path LiteLLM adds a tool-rendering system prompt AFTER the deployment
+    hook, so tokenizing the hook's pre-injection kwargs UNDERCOUNTS by ~20% of the tools
+    schema -- see the ACCURACY CAVEAT above. Returns None on any failure so the caller
+    skips injection -- never blocks the request."""
+    payload: dict = {"model": model, "messages": messages}
+    if tools:
+        payload["tools"] = tools
+    if chat_template_kwargs:
+        payload["chat_template_kwargs"] = chat_template_kwargs
+    try:
+        r = await client.post(f"{BACKEND_URL}/tokenize", json=payload, timeout=10.0)
+        if r.status_code == 200:
+            return int(r.json().get("count") or 0)
+        log.warning("preflight /tokenize http=%d body=%s", r.status_code, r.text[:200])
+    except Exception as exc:  # vLLM down, /tokenize unsupported, network -- skip injection
+        log.warning("preflight /tokenize failed: %s", exc)
+    return None
+
+
+async def _stash_preflight_usage(kwargs: dict, call_type) -> None:
+    """Preflight-count the prompt and stash it by litellm_call_id for the streaming
+    iterator hook to inject. Gated to streamed /v1/messages (the anthropic path): the
+    OpenAI path's chunks aren't message_start dicts, and non-streaming /v1/messages
+    already returns correct terminal usage (no iterator hook to consume a stash -> it
+    would leak). call_type is a CallTypes enum (str, Enum) or None; == "anthropic_messages"
+    covers both the enum and a bare string. Does not modify kwargs."""
+    if not INJECT_STREAMED_USAGE:
+        return
+    if call_type != "anthropic_messages":
+        return
+    if not kwargs.get("stream"):
+        return
+    model = _resolve_served_model(kwargs)
+    if not model:
+        return
+    count = await _preflight_input_tokens(
+        client=backend._client,
+        model=model,
+        messages=kwargs.get("messages") or [],
+        tools=kwargs.get("tools") or None,
+        chat_template_kwargs=_chat_template_kwargs(kwargs),
+    )
+    if not count:
+        return
+    cid = kwargs.get("litellm_call_id")
+    if not cid:
+        return
+    _USAGE_INJECT[cid] = count
+    log.info("preflight input_tokens=%d model=%s call_id=%s", count, model, str(cid)[:8])
+
+
+def _inject_usage_into_message_start(chunk, count: int):
+    """Rewrite usage.input_tokens=count in the first message_start chunk and return the
+    rewritten chunk; return None if the chunk is not a message_start (or unparseable),
+    so the caller yields the original unchanged and keeps scanning. The chunk is a
+    bytes/str SSE frame on the /v1/messages path (the anthropic pass-through serializes
+    to SSE BEFORE this hook -- the frame is `event: message_start\\ndata: {json}\\n\\n`);
+    a dict path is retained as a defensive fallback. Mirrors LiteLLM's own
+    `_inject_cost_into_sse_frame_str` SSE-rewrite pattern. Only the caller's first
+    message_start is rewritten (tracked by the `injected` flag)."""
+    # Dict path (defensive -- not seen on the current anthropic stream, which is bytes).
+    if isinstance(chunk, dict):
+        if chunk.get("type") == "message_start" and isinstance(chunk.get("message"), dict):
+            usage = chunk["message"].get("usage")
+            if not isinstance(usage, dict):
+                usage = {}
+                chunk["message"]["usage"] = usage
+            usage["input_tokens"] = count
+            return chunk
+        return None
+    # bytes/str SSE-frame path.
+    if isinstance(chunk, (bytes, bytearray)):
+        text = bytes(chunk).decode("utf-8", errors="replace")
+        was_bytes = True
+    elif isinstance(chunk, str):
+        text = chunk
+        was_bytes = False
+    else:
+        return None
+    if '"message_start"' not in text:
+        return None
+    lines = text.split("\n")
+    data_idx = next((i for i, ln in enumerate(lines) if ln.startswith("data: ")), None)
+    if data_idx is None:
+        return None
+    try:
+        obj = json.loads(lines[data_idx][6:])
+    except (ValueError, TypeError):
+        return None
+    if obj.get("type") != "message_start":
+        return None
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return None
+    usage = msg.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+        msg["usage"] = usage
+    usage["input_tokens"] = count
+    # Match LiteLLM's separators (", " / ": ") so the frame shape is stable; clients
+    # parse the JSON, so the whitespace is not semantically load-bearing.
+    lines[data_idx] = "data: " + json.dumps(obj, separators=(", ", ": "))
+    out = "\n".join(lines)
+    return out.encode("utf-8") if was_bytes else out
 
 
 class Backend:
@@ -338,6 +507,7 @@ class Handler(CustomLogger):
     # The INFO line is also the verify-probe: counts reveal whether the client strips
     # older turns' thinking (n_tb=0 -> cache needed) vs mapping alone suffices.
     async def async_pre_call_deployment_hook(self, kwargs, call_type):
+        await _stash_preflight_usage(kwargs, call_type)
         clamped = _clamp_max_tokens(kwargs)
         alias = _preserve_requested(kwargs)
         if alias is None:
@@ -376,6 +546,35 @@ class Handler(CustomLogger):
             kwargs["messages"] = rebuilt
         # Apply if either the clamp or the preserve mapping changed anything.
         return kwargs if (n_set or clamped) else None
+
+    # Streaming iterator hook (both endpoints; fires only for streaming responses).
+    # LiteLLM dispatches per-callback overrides here (kind=="override"). On the
+    # /v1/messages path the anthropic pass-through serializes to an SSE frame BEFORE
+    # this hook, so the chunk here is BYTES (`event: message_start\ndata: {json}\n\n`),
+    # not a dict -- _inject_usage_into_message_start parses that SSE frame and rewrites
+    # the FIRST message_start's usage.input_tokens to the preflight count stashed by
+    # _stash_preflight_usage (popped by litellm_call_id). A dict path is retained as a
+    # defensive fallback. No stash -> pass through unchanged (the /v1/chat/completions
+    # path, a failed preflight, or non-streaming).
+    async def async_post_call_streaming_iterator_hook(
+        self, user_api_key_dict, response, request_data
+    ):
+        cid = request_data.get("litellm_call_id") if isinstance(request_data, dict) else None
+        count = _USAGE_INJECT.pop(cid, None) if cid else None
+        if count is None:
+            async for chunk in response:
+                yield chunk
+            return
+        injected = False
+        async for chunk in response:
+            if not injected:
+                rewritten = _inject_usage_into_message_start(chunk, count)
+                if rewritten is not None:
+                    chunk = rewritten
+                    injected = True
+                    log.info("injected input_tokens=%d into message_start call_id=%s",
+                             count, str(cid)[:8])
+            yield chunk
 
 
 async def start_background_tasks() -> None:
