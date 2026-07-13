@@ -113,8 +113,7 @@ TPS, and prefix-cache hit %. Cache hit is read from vLLM `/metrics` (at the
 | `litellm_config.yaml` / `.moe.yaml` | LiteLLM config per stack: three model names, one shared backend (env-driven) |
 | `litellm_callbacks.py` | custom callback: wake-on-request + idle-stop |
 | `bin/claude-qwen` | Claude Code wrapper: `--model {moe|dense}` (default moe), sets `ANTHROPIC_*` env, execs `claude` against the proxy |
-| `bin/opencode-qwen` | opencode wrapper: `--model {moe|dense}` (default moe), private `XDG_CONFIG_HOME` pointing at our provider |
-| `opencode-qwen.json` / `-moe.json` | opencode provider config the wrapper copies from (baseURL, model limits; 64k dense / 128k MoE) |
+| `bin/opencode-qwen` | opencode wrapper: `--model {moe|dense}` (default moe), embeds the litellm provider config via `OPENCODE_CONFIG_CONTENT` and execs `opencode -m litellm/<line>` against the proxy |
 | `Makefile` | `run` / `start` / `stop` / `run35` / `start35` / `stop35` / `ci` / `test` / `test-integration` / `test-pcie` / `bench` / `bench35` / `bench_pcie` / `idle-test` / `litellm-logs` / `litellm-logs35` |
 | `scripts/coding_session_bench.py` | growing coding-session bench against vLLM (prefill/output tps; prefix-cache hit via `/metrics`). Defaults to vLLM (`:8000`) for real hit%; via the proxy (`:4000`) `hit%` reads 0 |
 | `scripts/pcie_bw_bench.py` | GPU↔host PCIe D2H/H2D bandwidth + TP=2 all-reduce estimate (in-container via `make bench_pcie` / `make test-pcie`) |
@@ -811,7 +810,8 @@ non-empty), sets the model to `qwen3.6-27b` / `qwen3.6-35b-a3b` and the
 background model to its `-nothink` variant, and enables gateway model discovery
 so `/model` lists all three flavors. Switch mid-session
 `/model qwen3.6-27b-preserve`, or set `QWEN_FLAVOR=preserve` before launch. Drive
-a remote box with `CLAUDE_QWEN_BASE_URL=http://10.0.0.5:4000 ./bin/claude-qwen`.
+a remote box with `CLAUDE_QWEN_BASE_URL=http://<ip-or-hostname>:4000 ./bin/claude-qwen`
+(`<ip-or-hostname>` is the box's LAN IP or hostname).
 The host needs the `claude` CLI on `PATH`.
 
 #### Drive it with opencode
@@ -826,15 +826,22 @@ running stack — start it first (`make start35` MoE / `make start` dense); the 
 stacks share one A10 + host `:4000`, so only one runs at a time and switching
 lines is a manual cold swap, not automatic. opencode ignores `OPENAI_BASE_URL`
 for its built-in `openai` provider, so the wrapper hands it a dedicated
-openai-compatible provider via a **private `XDG_CONFIG_HOME`** — a *copy* of
-`opencode-qwen.json` (dense) or `opencode-qwen-moe.json` (MoE) from this repo
-into a per-line cache dir. That isolates the session from your global
-`~/.config/opencode/opencode.json` (a copy, not a symlink, so opencode's
-write-backs land on the disposable copy, not the committed file). Pick the model
-with `-m litellm/qwen3.6-27b[-preserve|-nothink]`, or set `QWEN_FLAVOR`; the
+openai-compatible provider by embedding the `litellm` provider config (baseURL,
+apiKey, the line's three model variants with context/output limits) as a static
+JSON literal passed via `OPENCODE_CONFIG_CONTENT`. opencode deep-merges that as
+local scope on top of your global `~/.config/opencode/opencode.json` — global
+`mcp` servers (codebase-index/deepwiki/agentmail) are preserved, and only
+`provider`/`model`/`small_model` are overridden to the local Qwen line. No
+sidecar file, no cache dir, no repo-path lookup — the wrapper is self-contained
+and works unchanged from the `~/bin` copy. Pick the line with `--model
+{moe|dense}` and the flavor with `QWEN_FLAVOR` (default|preserve|nothink), or
+switch mid-session via `/model litellm/qwen3.6-<line>[-preserve|-nothink]`; the
 `-nothink` variant is the config's `small_model`. Context/output caps match the
 proxy (`limit.context` 64k dense / 128k MoE, `limit.output` 16384). Drive a
-remote box with `OPENCODE_QWEN_BASE_URL=http://10.0.0.5:4000 ./bin/opencode-qwen`.
+remote box with `OPENCODE_QWEN_BASE_URL=http://<ip-or-hostname>:4000 ./bin/opencode-qwen`
+(`<ip-or-hostname>` is the box's LAN IP or hostname; the wrapper exports the localhost
+default itself; opencode has no
+`{env:VAR:-default}` form).
 
 #### Tuning & security
 

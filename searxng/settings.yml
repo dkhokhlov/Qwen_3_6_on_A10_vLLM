@@ -8,6 +8,12 @@ use_default_settings: true
 server:
   bind_address: 0.0.0.0
   limiter: false          # internal-only; LiteLLM is a trusted programmatic client
+  # NOTE: SearXNG still logs a one-shot startup warning
+  # "X-Forwarded-For nor X-Real-IP header is set!" from searx.botdetection even with
+  # limiter:false (it inspects proxy headers at init). Benign -- the limiter is off,
+  # so per-query rate limiting never fires and the websearch_interception results
+  # return fine. SearXNG also emits no per-request access log to stdout, so absence
+  # of /search lines is expected, not a sign the queries didn't land.
   image_proxy: false
   public_instance: false
   secret_key: "21west-qwen-searxng-local-7f3a9c4e1b8d2056a4e7c9f1d2b3a486"  # local session-signing key (not a credential)
