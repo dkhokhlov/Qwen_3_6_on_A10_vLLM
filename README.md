@@ -1224,9 +1224,15 @@ with `CLAUDE_QWEN_PROXY_COMPACT=1`):
 RUN_LIVE_COMPACTION_PROBE=1 python3 -m pytest tests/integration/test_compaction_probe.py -m integration -o addopts="" -s
 ```
 
-This is a **temporary layer** intended to be removed once claude-code lifts the
-per-session breaker upstream; until then it is the only way to get repeated compaction
-on this proxy.
+This is a **temporary layer** intended to be removed once the upstream claude-code
+gateway-mode compaction blockers are lifted — notably
+[#65585](https://github.com/anthropics/claude-code/issues/65585) (auto-compact gated
+behind first-party auth since v2.1.161),
+[#68522](https://github.com/anthropics/claude-code/issues/68522) (custom
+`ANTHROPIC_BASE_URL` models assumed 200k, no way to declare a larger window), and
+[#44354](https://github.com/anthropics/claude-code/issues/44354) (reactive compaction
+handler null on resumed sessions — the per-session breaker this polyfill bypasses).
+Until then it is the only way to get repeated compaction on this proxy.
 
 ---
 
