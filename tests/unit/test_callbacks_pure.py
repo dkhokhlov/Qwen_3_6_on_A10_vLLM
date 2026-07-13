@@ -142,3 +142,61 @@ async def test_deployment_hook_preserve_but_no_reasoning_returns_none():
         "messages": [{"role": "assistant", "content": "ok"}],  # no thinking/reasoning
     }
     assert await h.async_pre_call_deployment_hook(kwargs, "acompletion") is None
+
+
+# --------------------------------------------------------------------------- #
+# _clamp_max_tokens + deployment hook: server-side cap on Claude Code's 32000
+# default (subagents/small-fast ignore CLAUDE_CODE_MAX_OUTPUT_TOKENS; this is the
+# deterministic backstop covering every request path on both endpoints).
+# --------------------------------------------------------------------------- #
+def test_clamp_reduces_oversized_max_tokens():
+    kw = {"max_tokens": 32000}
+    assert L._clamp_max_tokens(kw) is True
+    assert kw["max_tokens"] == L.MAX_TOKENS_CAP
+
+
+def test_clamp_leaves_undersized_max_tokens_unchanged():
+    kw = {"max_tokens": 4096}
+    assert L._clamp_max_tokens(kw) is False
+    assert kw["max_tokens"] == 4096
+
+
+def test_clamp_handles_max_completion_tokens_field():
+    kw = {"max_completion_tokens": 32000}
+    assert L._clamp_max_tokens(kw) is True
+    assert kw["max_completion_tokens"] == L.MAX_TOKENS_CAP
+
+
+def test_clamp_noop_when_no_max_tokens_field():
+    kw = {"messages": []}
+    assert L._clamp_max_tokens(kw) is False
+    assert kw == {"messages": []}
+
+
+async def test_deployment_hook_clamps_non_preserve_and_returns_kwargs():
+    # The 400 path: a non-preserve (strip/nothink) request sends max_tokens=32000. The
+    # hook must clamp it AND return kwargs so LiteLLM applies the cap (None would skip).
+    h = L.Handler()
+    kwargs = {"model": "qwen3.6-35b-a3b-nothink", "messages": [{"role": "user", "content": "hi"}],
+              "max_tokens": 32000}
+    out = await h.async_pre_call_deployment_hook(kwargs, "acompletion")
+    assert out is not None
+    assert out["max_tokens"] == L.MAX_TOKENS_CAP
+
+
+async def test_deployment_hook_non_preserve_no_max_tokens_returns_none():
+    # No max_tokens -> clamp no-op -> non-preserve -> None (unchanged behavior).
+    h = L.Handler()
+    kwargs = {"model": "qwen3.6-27b", "messages": [{"role": "user", "content": "hi"}]}
+    assert await h.async_pre_call_deployment_hook(kwargs, "acompletion") is None
+
+
+async def test_deployment_hook_preserve_clamps_even_when_no_reasoning():
+    # A -preserve request with max_tokens=32000 but no prior reasoning: nothing to map,
+    # but the clamp still applies -> returns kwargs (not None).
+    h = L.Handler()
+    kwargs = {"model": "qwen3.6-27b-preserve",
+              "messages": [{"role": "user", "content": "hi"}], "max_tokens": 32000}
+    out = await h.async_pre_call_deployment_hook(kwargs, "acompletion")
+    assert out is not None
+    assert out["max_tokens"] == L.MAX_TOKENS_CAP

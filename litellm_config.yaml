@@ -23,8 +23,10 @@ model_list:
       api_key: dummy
       extra_body:
         chat_template_kwargs: { preserve_thinking: false }
-    model_info:                       # advertise so Claude Code sizes max_tokens to it, else it defaults to
-      max_output_tokens: 16384        # 32000 -- which + the ~32k system prompt exceeds --max-model-len
+    model_info:                       # /v1/models metadata for non-Claude-Code clients (open-webui). NOTE:
+      max_output_tokens: 8192         # Claude Code's gateway discovery reads only id/display_name, NEVER this,
+                                     # so it sends max_tokens=32000 regardless. The real cap is the server-side
+                                     # clamp in litellm_callbacks.py (env CLAUDE_QWEN_MAX_TOKENS_CAP=8192 here).
   - model_name: qwen3.6-27b-preserve
     litellm_params:
       model: os.environ/LITELLM_VLLM_MODEL
@@ -33,7 +35,7 @@ model_list:
       extra_body:
         chat_template_kwargs: { preserve_thinking: true }
     model_info:
-      max_output_tokens: 16384
+      max_output_tokens: 8192
   - model_name: qwen3.6-27b-nothink
     litellm_params:
       model: os.environ/LITELLM_VLLM_MODEL
@@ -42,7 +44,7 @@ model_list:
       extra_body:
         chat_template_kwargs: { enable_thinking: false, preserve_thinking: false }
     model_info:
-      max_output_tokens: 16384
+      max_output_tokens: 8192
 
 litellm_settings:
   # Wake-on-request + idle-stop live in litellm_callbacks.start_background_tasks

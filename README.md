@@ -808,7 +808,13 @@ lines is a manual cold swap, not automatic. `claude-qwen` points Claude Code at 
 `ANTHROPIC_AUTH_TOKEN` (the proxy is auth-free; Claude Code just needs one
 non-empty), sets the model to `qwen3.6-27b` / `qwen3.6-35b-a3b` and the
 background model to its `-nothink` variant, and enables gateway model discovery
-so `/model` lists all three flavors. Switch mid-session
+so `/model` lists all three flavors. It also tells Claude Code the *real* upstream
+window (`CLAUDE_CODE_AUTO_COMPACT_WINDOW` = 128k MoE / 64k dense) and caps output
+(`CLAUDE_CODE_MAX_OUTPUT_TOKENS` = 16384 MoE / 8192 dense): behind a gateway, Claude
+Code otherwise assumes a 200k window and sends `max_tokens=32000`, so auto-compaction
+fires past the 128k/64k wall and the request overflows (a 400 `ContextWindowExceeded`).
+The proxy's `CLAUDE_QWEN_MAX_TOKENS_CAP` (above) is the server-side backstop for
+subagents/the small-fast model, which ignore the client env. Switch mid-session
 `/model qwen3.6-27b-preserve`, or set `QWEN_FLAVOR=preserve` before launch. Drive
 a remote box with `CLAUDE_QWEN_BASE_URL=http://<ip-or-hostname>:4000 ./bin/claude-qwen`
 (`<ip-or-hostname>` is the box's LAN IP or hostname).
@@ -837,7 +843,7 @@ and works unchanged from the `~/bin` copy. Pick the line with `--model
 {moe|dense}` and the flavor with `QWEN_FLAVOR` (default|preserve|nothink), or
 switch mid-session via `/model litellm/qwen3.6-<line>[-preserve|-nothink]`; the
 `-nothink` variant is the config's `small_model`. Context/output caps match the
-proxy (`limit.context` 64k dense / 128k MoE, `limit.output` 16384). Drive a
+proxy (`limit.context` 64k dense / 128k MoE, `limit.output` 8192 dense / 16384 MoE). Drive a
 remote box with `OPENCODE_QWEN_BASE_URL=http://<ip-or-hostname>:4000 ./bin/opencode-qwen`
 (`<ip-or-hostname>` is the box's LAN IP or hostname; the wrapper exports the localhost
 default itself; opencode has no
@@ -850,6 +856,7 @@ default itself; opencode has no
 | `VLLM_IDLE_SECONDS` | 900 | sustained idle before stop |
 | `VLLM_POLL_SECONDS` | 10 | `/metrics` poll interval |
 | `VLLM_WAKE_TIMEOUT` | 240 (27B) / 300 (MoE) | cold-start health-wait budget |
+| `CLAUDE_QWEN_MAX_TOKENS_CAP` | 16384 | server-side `max_tokens` clamp (8192 dense / 16384 MoE). Claude Code's gateway discovery ignores token limits, so it sends its built-in `max_tokens=32000` on every path — incl. subagents and the small/fast model, which ignore `CLAUDE_CODE_MAX_OUTPUT_TOKENS`. The deployment hook in `litellm_callbacks.py` caps it before vLLM on both endpoints; this env sets the per-stack ceiling. Must satisfy `PCT×WINDOW + cap ≤ WINDOW` (PCT=80 → cap ≤ WINDOW/5): dense 8192 ≤ 12800, MoE 16384 ≤ 25600. |
 
 `make litellm-logs` / `make litellm-logs35` tail the proxy (wake/stop events log
 here). The idle-stop is a deliberate `docker stop` (Engine API), so the backend

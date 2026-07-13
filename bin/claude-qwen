@@ -35,8 +35,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$MODEL" in
-  moe)   BASE="qwen3.6-35b-a3b" ;;
-  dense) BASE="qwen3.6-27b" ;;
+  moe)   BASE="qwen3.6-35b-a3b"; CTX_WINDOW=128000; MAX_OUTPUT=16384 ;;
+  dense) BASE="qwen3.6-27b";     CTX_WINDOW=64000;  MAX_OUTPUT=8192  ;;
   *) echo "claude-qwen: --model must be 'moe' or 'dense' (got '$MODEL')" >&2; exit 2 ;;
 esac
 
@@ -53,6 +53,19 @@ export ANTHROPIC_MODEL="$BASE$FLAVOR"                                        # d
 export ANTHROPIC_SMALL_FAST_MODEL="$BASE-nothink"                            # bg: no reasoning
 export CLAUDE_MODEL="$BASE$FLAVOR"   # the 'claude' on PATH reads this -> --model
 export CLAUDE_CODE_SUBAGENT_MODEL="$BASE-nothink"
+
+# Claude Code's gateway model discovery reads only id/display_name from /v1/models,
+# never token limits, so behind this proxy it assumes a 200k window AND sends its
+# built-in max_tokens=32000 default. Both break the real upstream (--max-model-len):
+# compaction is calibrated to 200k -> fires at 160k, PAST the 128k/64k wall, so input
+# grows unchecked until it overflows; and 32000 + a large prompt overflows directly.
+# Tell it the real window and cap output so compaction triggers at 80% of the actual
+# window. The LiteLLM deployment-hook clamp (litellm_callbacks.py, env
+# CLAUDE_QWEN_MAX_TOKENS_CAP) is the backstop for subagents + the small/fast model,
+# which ignore CLAUDE_CODE_MAX_OUTPUT_TOKENS (claude-code issue #25569). PCT is 80
+# (settings.json); the cap must satisfy PCT*WINDOW + cap <= WINDOW -> cap <= WINDOW/5.
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW="$CTX_WINDOW"
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="$MAX_OUTPUT"
 
 # Let the /model picker list all three flavors; cut telemetry noise.
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1

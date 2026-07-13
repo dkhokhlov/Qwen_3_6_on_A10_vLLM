@@ -48,10 +48,29 @@ def test_three_flavors_present(compose_p, litellm_p, base):
 
 
 @pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
-def test_every_model_advertises_max_output_tokens(compose_p, litellm_p, base):
-    litellm = _load(litellm_p)
+def test_model_info_max_output_tokens_matches_server_clamp(compose_p, litellm_p, base):
+    # Claude Code's gateway discovery ignores model_info.max_output_tokens (it reads only
+    # id/display_name from /v1/models), so the REAL cap is the server-side clamp env on
+    # the litellm service. model_info is just /v1/models metadata for other clients; it
+    # must at least agree with the clamp so the advertised limit isn't a lie.
+    compose, litellm = _load(compose_p), _load(litellm_p)
+    cap = int(compose["services"]["litellm"]["environment"]["CLAUDE_QWEN_MAX_TOKENS_CAP"])
     for m in litellm["model_list"]:
-        assert m["model_info"]["max_output_tokens"] == 16384, m["model_name"]
+        assert m["model_info"]["max_output_tokens"] == cap, m["model_name"]
+
+
+@pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
+def test_max_tokens_cap_fits_under_compaction_window(compose_p, litellm_p, base):
+    # The 400 root cause: Claude Code assumes a 200k window and sizes compaction to it,
+    # so for a 128k/64k upstream compaction fires PAST the wall and the request overflows.
+    # CLAUDE_CODE_AUTO_COMPACT_WINDOW (set in bin/claude-qwen) re-targets compaction to the
+    # real window; the cap must then satisfy PCT*WINDOW + cap <= WINDOW so the compaction
+    # request itself fits. PCT is 80 (settings.json CLAUDE_AUTOCOMPACT_PCT_OVERRIDE),
+    # WINDOW is vLLM's --max-model-len, cap is the server clamp env -> cap <= WINDOW/5.
+    toks = _cmd_tokens(_load(compose_p))
+    window = int(_flag(toks, "--max-model-len"))
+    cap = int(_load(compose_p)["services"]["litellm"]["environment"]["CLAUDE_QWEN_MAX_TOKENS_CAP"])
+    assert cap <= window // 5, f"{base}: cap {cap} must be <= WINDOW/5 ({window // 5}) for PCT=80"
 
 
 @pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)

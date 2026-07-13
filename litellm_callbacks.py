@@ -64,6 +64,15 @@ BOOT_TIMEOUT_SECONDS = float(os.environ.get("BOOT_TIMEOUT_SECONDS", "600"))
 DOCKER_API_BASE = os.environ.get("DOCKER_API_BASE")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 
+# Server-side max_tokens cap. Claude Code's gateway discovery ignores token limits,
+# so it sends its built-in max_tokens=32000 on EVERY path -- including subagents and
+# the small/fast model, which ignore the client-side CLAUDE_CODE_MAX_OUTPUT_TOKENS
+# env var (claude-code issue #25569). The deployment hook below is the single point
+# that sees OpenAI-shape kwargs on BOTH endpoints after Anthropic->OpenAI conversion,
+# so clamping here covers every request regardless of what the client sent. Per-stack
+# via compose env (moe=16384, dense=8192); must satisfy PCT*WINDOW + cap <= WINDOW.
+MAX_TOKENS_CAP = int(os.environ.get("CLAUDE_QWEN_MAX_TOKENS_CAP", "16384"))
+
 
 def _metric(line: str) -> int:
     # Prometheus exposition line: "name{labels} value"
@@ -114,6 +123,27 @@ def _preserve_requested(kwargs: dict) -> str | None:
     if isinstance(ctk, dict) and ctk.get("preserve_thinking") is True:
         return "<preserve_thinking=true>"
     return None
+
+
+def _clamp_max_tokens(kwargs: dict) -> bool:
+    """Cap max_tokens/max_completion_tokens to MAX_TOKENS_CAP in place.
+
+    Claude Code sends its built-in max_tokens=32000 (gateway discovery ignores the
+    advertised limit) on every path -- including subagents and the small/fast model,
+    which ignore CLAUDE_CODE_MAX_OUTPUT_TOKENS. The deployment hook is the one point
+    that sees OpenAI-shape kwargs on both endpoints, so this is the deterministic
+    backstop. Clamp only when the client asked for more than the cap; leave absent
+    fields to vLLM's default. Returns whether anything was changed, so the hook can
+    return kwargs (apply) only when a change occurred (LiteLLM skips on None).
+    """
+    changed = False
+    for key in ("max_tokens", "max_completion_tokens"):
+        v = kwargs.get(key)
+        if isinstance(v, (int, float)) and v > MAX_TOKENS_CAP:
+            log.info("max_tokens clamp: %s %d -> %d", key, int(v), MAX_TOKENS_CAP)
+            kwargs[key] = MAX_TOKENS_CAP
+            changed = True
+    return changed
 
 
 class Backend:
@@ -308,9 +338,12 @@ class Handler(CustomLogger):
     # The INFO line is also the verify-probe: counts reveal whether the client strips
     # older turns' thinking (n_tb=0 -> cache needed) vs mapping alone suffices.
     async def async_pre_call_deployment_hook(self, kwargs, call_type):
+        clamped = _clamp_max_tokens(kwargs)
         alias = _preserve_requested(kwargs)
         if alias is None:
-            return None
+            # Non-preserve: only the clamp may have changed kwargs; return it so LiteLLM
+            # applies the cap (returning None would skip even an in-place clamp).
+            return kwargs if clamped else None
         messages = kwargs.get("messages") or []
         rebuilt: list = []
         n_tb = n_rs = n_rc = n_set = 0
@@ -341,8 +374,8 @@ class Handler(CustomLogger):
         )
         if n_set:
             kwargs["messages"] = rebuilt
-            return kwargs
-        return None
+        # Apply if either the clamp or the preserve mapping changed anything.
+        return kwargs if (n_set or clamped) else None
 
 
 async def start_background_tasks() -> None:

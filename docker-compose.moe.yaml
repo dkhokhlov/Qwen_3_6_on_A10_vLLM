@@ -113,6 +113,7 @@ services:
       WAKE_TIMEOUT_SECONDS: "${VLLM_WAKE_TIMEOUT:-300}"
       LITELLM_WORKER_STARTUP_HOOKS: litellm_callbacks:start_background_tasks
       PYTHONPATH: /app
+      CLAUDE_QWEN_MAX_TOKENS_CAP: "16384"   # server-side clamp (moe 128k ctx): PCT80 -> cap <= 25600
       SEARXNG_API_BASE: http://searxng:8080   # SearXNG instance for websearch_interception (searxng provider)
     volumes:
       - ./litellm_config.moe.yaml:/app/litellm_config.yaml:ro
