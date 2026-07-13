@@ -135,10 +135,18 @@ PROXY_COMPACT = os.environ.get(
 # compose envs override this with tuned per-stack values (90000 MoE / 50000 dense) that
 # leave more MoE headroom; this code default is the fallback when the env is unset.
 PROXY_COMPACT_THRESHOLD = int(os.environ.get("CLAUDE_QWEN_PROXY_COMPACT_THRESHOLD", "50000"))
-# litellm_call_id -> preflight input-token count. Set in async_pre_call_deployment_hook,
-# consumed+popped in async_post_call_streaming_iterator_hook. litellm_call_id is the same
-# value at both hooks (self.data flows to kwargs and to request_data -- see plan).
+# litellm_call_id -> preflight input-token count. Set in log_pre_api_call, consumed+popped
+# in async_post_call_streaming_iterator_hook. litellm_call_id is the same value at both
+# hooks (self.data flows to kwargs and to request_data -- see plan).
+#
+# Backstop: success pops immediately, so this dict only RETAINS entries from streamed
+# requests that failed after the preflight stash but before the streaming iterator hook
+# ran (vLLM 400/500, cold-wake timeout, client disconnect). Cap it so a long-running
+# proxy can't grow it unboundedly; evict the OLDEST (a long-stale failed entry -- the
+# in-flight entry is always the newest, with --max-num-seqs 1 + num_workers 1, so it is
+# never the one evicted). 4096 is far above any realistic in-flight count.
 _USAGE_INJECT: dict[str, int] = {}
+_USAGE_INJECT_CAP = 4096
 
 
 def _metric(line: str) -> int:
@@ -656,6 +664,11 @@ class Handler(CustomLogger):
         )
         if not count:
             return
+        # Backstop for the failed-streamed-request leak (see _USAGE_INJECT_CAP). Evict the
+        # oldest entry when at cap; insertion-ordered dict -> next(iter()) is the oldest,
+        # a long-stale failed entry (never the fresh in-flight one with concurrency ~1).
+        if len(_USAGE_INJECT) >= _USAGE_INJECT_CAP:
+            del _USAGE_INJECT[next(iter(_USAGE_INJECT))]
         _USAGE_INJECT[cid] = count
         log.info("preflight input_tokens=%d model=%s call_id=%s", count, smodel, str(cid)[:8])
 

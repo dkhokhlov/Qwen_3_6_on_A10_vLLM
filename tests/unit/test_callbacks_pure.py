@@ -351,6 +351,31 @@ def test_log_pre_api_call_skips_when_preflight_returns_none(monkeypatch):
     assert "x" not in L._USAGE_INJECT
 
 
+def test_usage_inject_stash_capped_evicts_oldest(monkeypatch):
+    # Backstop for the failed-streamed-request leak: a streamed request that is stashed
+    # but never popped (failure before the streaming iterator hook ran) leaves a stale
+    # entry. Simulate _USAGE_INJECT_CAP such failures (never popped) + one more, and
+    # confirm the dict is capped and the OLDEST entry was evicted (FIFO), while the
+    # fresh in-flight entry survives. Uses a tiny cap so the test is fast.
+    monkeypatch.setattr(L, "_preflight_input_tokens_sync", lambda **kw: 7)
+    monkeypatch.setattr(L, "_USAGE_INJECT_CAP", 8)
+    L._USAGE_INJECT.clear()
+    try:
+        h = L.Handler()
+        oldest_cid = "cid-00"
+        for i in range(9):                          # 9 = cap(8) + 1 -> one eviction
+            cid = f"cid-{i:02d}"
+            kwargs = {"call_type": "anthropic_messages", "stream": True, "litellm_call_id": cid,
+                      "additional_args": {"complete_input_dict": {"model": "qwen3.6-35b-a3b",
+                        "messages": [{"role": "user", "content": "hi"}]}}}
+            h.log_pre_api_call("qwen3.6-35b-a3b", [], kwargs)
+        assert len(L._USAGE_INJECT) == 8             # capped, not 9
+        assert oldest_cid not in L._USAGE_INJECT     # oldest evicted (FIFO)
+        assert "cid-08" in L._USAGE_INJECT           # newest (in-flight) survives
+    finally:
+        L._USAGE_INJECT.clear()
+
+
 async def _agen(chunks):
     for c in chunks:
         yield c
