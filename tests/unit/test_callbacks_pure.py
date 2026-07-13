@@ -400,6 +400,7 @@ async def test_pre_request_hook_off_returns_none_and_does_not_mutate(monkeypatch
     out = await h.async_pre_request_hook(kwargs["model"], kwargs["messages"], kwargs)
     assert out is None
     assert "context_management" not in kwargs   # no in-place mutation when off
+    assert "drop_params" not in kwargs          # no per-request un-gate when off
 
 
 async def test_pre_request_hook_on_injects_context_management(monkeypatch):
@@ -413,6 +414,11 @@ async def test_pre_request_hook_on_injects_context_management(monkeypatch):
     edit = out["context_management"]["edits"][0]
     assert edit["type"] == "compact_20260112"
     assert edit["trigger"] == {"type": "input_tokens", "value": 90000}
+    # Top-level per-request drop_params=False un-gates the polyfill for THIS opt-in
+    # call, overriding the global drop_params:true the router set. Must be top-level:
+    # the hook's litellm_params sub-dict is popped+discarded (messages/handler.py:261),
+    # so a sub-dict key would never reach the polyfill gate.
+    assert out["drop_params"] is False
 
 
 async def test_pre_request_hook_threshold_env_drives_value(monkeypatch):

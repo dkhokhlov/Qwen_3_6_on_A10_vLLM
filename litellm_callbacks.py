@@ -118,9 +118,11 @@ INJECT_STREAMED_USAGE = os.environ.get(
 # usage resets claude's tracker (repeat). The async_pre_request_hook injects
 # `context_management` on the /v1/messages pass-through path when this is on;
 # off (default) -> hook returns None, zero change. The polyfill gate reads
-# drop_params (truthy -> no-op), so litellm_settings.drop_params must be false
-# (see litellm_config.*.yaml); the polyfill only RUNS when context_management is
-# present, so un-gating is harmless for non-opt-in traffic. Requires
+# drop_params (truthy -> no-op), so the hook ALSO sets a per-request
+# drop_params=False (top-level; see the hook) to un-gate the polyfill for opt-in
+# traffic ONLY. The GLOBAL litellm_settings.drop_params stays true (keeps
+# dropping vLLM-rejected params for all other requests -> no 400s); the
+# per-request False overrides it for the opt-in /v1/messages call. Requires
 # general_settings.context_management_summary_model (else the polyfill errors
 # inline `summary_model_not_configured` and silently no-ops -- not an HTTP 400).
 PROXY_COMPACT = os.environ.get(
@@ -518,8 +520,21 @@ class Handler(CustomLogger):
                 "trigger": {"type": "input_tokens", "value": PROXY_COMPACT_THRESHOLD},
             }]
         }
+        # Un-gate the polyfill for THIS request only. The compact_20260112 polyfill
+        # short-circuits to no-op when drop_params is truthy (adapters/handler.py:
+        # effective_drop_params = drop_params if drop_params is not None else
+        # litellm.drop_params; if effective_drop_params: return None). The per-request
+        # value must be a TOP-LEVEL key here: the hook's `litellm_params` sub-dict is
+        # popped+discarded (messages/handler.py:261), so a sub-dict key would not reach
+        # the gate. Top-level drop_params survives the named pops, merges via
+        # kwargs.update -> GenericLiteLLMParams(**kwargs) -> litellm_params.drop_params
+        # (read at messages/handler.py:503) and OVERRIDES the global litellm.drop_params
+        # the router set. Verified live (A/B): global drop_params:true blocks the
+        # polyfill; adding this per-request False un-blocks it for opt-in traffic
+        # while leaving global drop_params:true in force for every other request.
+        kwargs["drop_params"] = False
         log.info(
-            "proxy-compact: injected context_management trigger=%d model=%s",
+            "proxy-compact: injected context_management trigger=%d drop_params=False model=%s",
             PROXY_COMPACT_THRESHOLD, model,
         )
         return kwargs
