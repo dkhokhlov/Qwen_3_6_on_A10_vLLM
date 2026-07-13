@@ -60,6 +60,19 @@ def test_model_info_max_output_tokens_matches_server_clamp(compose_p, litellm_p,
 
 
 @pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
+def test_inject_streamed_usage_env_present_and_on(compose_p, litellm_p, base):
+    # Auto-compaction never fires unless the proxy reports accurate streamed
+    # message_start.usage.input_tokens (Claude Code's tracker reads the STREAMED start
+    # usage, not the terminal result). CLAUDE_QWEN_INJECT_STREAMED_USAGE gates the
+    # preflight /tokenize + inject fix; it must be present and "1" in both stacks, or
+    # compaction silently never fires (the original unbounded-growth-to-400 regression).
+    env = _load(compose_p)["services"]["litellm"]["environment"]
+    assert env.get("CLAUDE_QWEN_INJECT_STREAMED_USAGE") == "1", (
+        "CLAUDE_QWEN_INJECT_STREAMED_USAGE must be \"1\" so auto-compact fires"
+    )
+
+
+@pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
 def test_max_tokens_cap_fits_under_compaction_window(compose_p, litellm_p, base):
     # The 400 root cause: Claude Code assumes a 200k window and sizes compaction to it,
     # so for a 128k/64k upstream compaction fires PAST the wall and the request overflows.

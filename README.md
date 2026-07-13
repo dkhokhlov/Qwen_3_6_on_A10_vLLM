@@ -52,6 +52,7 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 - [Prefix caching](#prefix-caching)
 - [Experiments that did NOT work](#experiments-that-did-not-work-do-not-retry-without-reason)
 - [Hardware ceiling facts](#hardware-ceiling-facts)
+- [Auto-compaction on the Qwen proxy](#auto-compaction-on-the-qwen-proxy)
 - [Gotchas](#gotchas)
 
 **Part 4 — Scaling Beyond One A10**
@@ -812,9 +813,11 @@ so `/model` lists all three flavors. It also tells Claude Code the *real* upstre
 window (`CLAUDE_CODE_AUTO_COMPACT_WINDOW` = 128k MoE / 64k dense) and caps output
 (`CLAUDE_CODE_MAX_OUTPUT_TOKENS` = 16384 MoE / 8192 dense): behind a gateway, Claude
 Code otherwise assumes a 200k window and sends `max_tokens=32000`, so auto-compaction
-fires past the 128k/64k wall and the request overflows (a 400 `ContextWindowExceeded`).
+is scheduled past the 128k/64k wall and the request overflows (a 400 `ContextWindowExceeded`).
 The proxy's `CLAUDE_QWEN_MAX_TOKENS_CAP` (above) is the server-side backstop for
-subagents/the small-fast model, which ignore the client env. Switch mid-session
+subagents/the small-fast model, which ignore the client env. Sizing the window is
+necessary but not sufficient — the proxy must also report accurate streamed usage for
+compaction to actually fire; see [Auto-compaction on the Qwen proxy](#auto-compaction-on-the-qwen-proxy). Switch mid-session
 `/model qwen3.6-27b-preserve`, or set `QWEN_FLAVOR=preserve` before launch. Drive
 a remote box with `CLAUDE_QWEN_BASE_URL=http://<ip-or-hostname>:4000 ./bin/claude-qwen`
 (`<ip-or-hostname>` is the box's LAN IP or hostname).
@@ -1038,6 +1041,96 @@ param-bound). Do not retry without reason.
 - **Idle vLLM log lines are misleading**: `Avg generation throughput: 2.4 t/s`
   and `Prefix cache hit rate: 0.0%` at idle are a rolling-average artifact and
   an empty-window sample — not the serving rate. The per-turn bench column is authoritative.
+
+### Auto-compaction on the Qwen proxy
+
+Claude Code proactively auto-compacts a conversation when its running context count
+crosses a threshold (~80% of the window set by `CLAUDE_CODE_AUTO_COMPACT_WINDOW`,
+per `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`). That running count is grown from the
+**streamed `message_start.usage.input_tokens`** of each turn — *not* the terminal
+`result.usage`. The LiteLLM→vLLM proxy hardcodes `message_start.usage.input_tokens: 0`
+(the real count arrives only in the terminal `message_delta`, because vLLM, like OpenAI,
+emits usage in the final streaming chunk), so Claude Code's tracker stays at 0, the
+threshold is never crossed, and compaction **never fires** — context grows unbounded
+until a 400 `ContextWindowExceeded`. This is why the window/cap fix alone
+(`CLAUDE_CODE_AUTO_COMPACT_WINDOW` + `CLAUDE_QWEN_MAX_TOKENS_CAP`) is necessary but not
+sufficient: it sizes the window and caps output, but compaction still will not fire until
+the proxy reports accurate streamed usage. (The `~/bin/glm` wrapper works because z.ai's
+endpoint reports `message_start` usage correctly — compaction fires there at ~70%.)
+
+The fix is server-side, in `litellm_callbacks.py` (`CLAUDE_QWEN_INJECT_STREAMED_USAGE=1`,
+default on): preflight-tokenize the prompt with vLLM `POST /tokenize` and inject that
+count into the streamed `message_start`. The count is exact because `/tokenize` applies
+the same chat template vLLM uses for generation.
+
+The non-obvious part is *where* the preflight runs. Two hook points were considered:
+
+- `async_pre_call_deployment_hook` — fires **before** LiteLLM converts the Anthropic
+  request to the OpenAI shape vLLM expects, so its `messages`/`tools` are pre-conversion.
+  `/tokenize` of them undercounts tool-bearing requests (the system-message merge and
+  tool-format conversion happen after the hook). For real Claude Code (~28k-token fixed
+  tools schema) the gap is large enough to fire compaction late, past the dense stack's
+  safety margin.
+- `log_pre_api_call` (a logging-path hook, read-only) — fires **after**
+  `transform_request` builds the exact wire body and **before** the HTTP POST to vLLM.
+  Its `kwargs["additional_args"]["complete_input_dict"]` *is* the post-conversion body
+  vLLM receives, so `/tokenize` of it == vLLM's `prompt_tokens` exactly — for tools and
+  no-tools alike.
+
+There is no request-path/mutation hook that fires post-conversion on this path
+(`async_pre_request_hook` is dispatched only on the outer pass-through handler, on the
+*original* Anthropic kwargs; `async_log_pre_api_call` is not dispatched at all). Read-only
+is sufficient because the actual mutation is done in the streaming iterator hook, which
+rewrites the first `message_start` SSE frame. `log_pre_api_call` runs in a LiteLLM
+threadpool worker (not the event loop — `asyncio.get_running_loop()` raises there), so the
+sync `/tokenize` (urllib, stdlib — thread-safe across workers, unlike a shared
+`httpx.Client`) does not block the loop, and it completes before the POST — so the stashed
+count is ready before `message_start` is emitted. The stash is keyed by `litellm_call_id`,
+the same value at both hooks (the nested inner `acompletion` reuses the outer call id).
+
+```
+        Claude Code   (auto-compact tracker reads message_start.usage.input_tokens)
+             │   POST /v1/messages  (stream, Anthropic shape, +tools)
+             ▼
+ ┌───────────────────────────────────────────────────────────────────────┐
+ │ LiteLLM  /v1/messages   (experimental_pass_through handler)           │
+ │                                                                       │
+ │  outer async_pre_request_hook ── original Anthropic kwargs            │ ← pre-conversion (not used)
+ │          │                                                            │
+ │          ▼  adapter: Anthropic → OpenAI                               │   system→system msg,
+ │          │                                                            │   tools→tools[] (separate)
+ │          ▼  inner litellm.acompletion()                               │
+ │  async_pre_call_deployment_hook ── OpenAI kwargs                      │ ← pre-conversion (undercounts tools)
+ │          │                                                            │
+ │          ▼  transform_request  →  wire body (data)                    │
+ │  ★ log_pre_api_call ── complete_input_dict = data                    │ ← POST-conversion  (EXACT)
+ │          │      PREFLIGHT: POST vLLM /tokenize                        │   stash count by litellm_call_id
+ │          ▼  HTTP POST /v1/chat/completions  (stream)                  │
+ └─────────────────────────┬─────────────────────────────────────────────┘
+                           ▼
+              vLLM   (qwen3.6; /tokenize uses the same chat template)
+                           │   SSE stream (OpenAI; usage in the FINAL chunk)
+                           ▼
+ ┌───────────────────────────────────────────────────────────────────────┐
+ │ LiteLLM  serialize → Anthropic SSE                                    │
+ │  ★ async_post_call_streaming_iterator_hook                            │ ← INJECT: rewrite the first
+ │          │      message_start.usage.input_tokens = stashed count      │   message_start SSE frame
+ │          ▼   event: message_start\ndata: {… "usage": {…}}            │
+ └─────────────────────────┬─────────────────────────────────────────────┘
+                           ▼
+        Claude Code   tracker grows → crosses ~80% → compact_boundary fires
+```
+
+Verified live (MoE stack, claude 2.1.193 via `/v1/messages`):
+
+- 4-tool request: `message_start.input_tokens` 0 → **538**; terminal `message_delta` 538 (exact).
+- no-tools request: 0 → **15**; terminal 15 (exact).
+- Same `litellm_call_id` at `log_pre_api_call` and the iterator hook → injection fires.
+
+To disable (revert to the zero-streamed-usage behavior, e.g. to debug compaction):
+set `CLAUDE_QWEN_INJECT_STREAMED_USAGE=0` in the litellm compose env and recreate the
+litellm container (`make start35` / `make start`, or `docker compose -f
+docker-compose.moe.yaml up -d --force-recreate litellm` to keep vLLM warm).
 
 ---
 

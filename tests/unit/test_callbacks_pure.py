@@ -200,3 +200,157 @@ async def test_deployment_hook_preserve_clamps_even_when_no_reasoning():
     out = await h.async_pre_call_deployment_hook(kwargs, "acompletion")
     assert out is not None
     assert out["max_tokens"] == L.MAX_TOKENS_CAP
+
+
+# --------------------------------------------------------------------------- #
+# Streamed-usage injection: preflight /tokenize + message_start rewrite.
+# Auto-compact reads the STREAMED message_start.usage.input_tokens (not the
+# terminal result); LiteLLM hardcodes it to 0, so the tracker never grows and
+# compaction never fires. Fix: preflight /tokenize at log_pre_api_call (the
+# post-conversion wire body) and inject into the first message_start SSE frame.
+# --------------------------------------------------------------------------- #
+def test_served_model_strips_provider_prefix():
+    assert L._served_model("hosted_vllm/qwen3.6-35b-a3b") == "qwen3.6-35b-a3b"
+
+
+def test_served_model_passes_through_bare_name():
+    assert L._served_model("qwen3.6-35b-a3b") == "qwen3.6-35b-a3b"
+
+
+def test_served_model_falls_back_to_env(monkeypatch):
+    monkeypatch.setattr(L.os, "environ", {"LITELLM_VLLM_MODEL": "hosted_vllm/qwen3.6-27b"})
+    assert L._served_model(None) == "qwen3.6-27b"
+
+
+class _FakeResp:
+    def __init__(self, data): self._data = data
+    def read(self): return self._data
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def test_preflight_sync_returns_count(monkeypatch):
+    monkeypatch.setattr(L.urllib.request, "urlopen",
+                        lambda req, timeout=10.0: _FakeResp(b'{"count": 538}'))
+    assert L._preflight_input_tokens_sync(
+        model="qwen3.6-35b-a3b", messages=[{"role": "user", "content": "hi"}]) == 538
+
+
+def test_preflight_sync_returns_none_on_error(monkeypatch):
+    monkeypatch.setattr(L.urllib.request, "urlopen", lambda req, timeout=10.0: (_ for _ in ()).throw(OSError("down")))
+    assert L._preflight_input_tokens_sync(model="qwen3.6-35b-a3b", messages=[]) is None
+
+
+def test_inject_usage_rewrites_bytes_message_start():
+    chunk = (b'event: message_start\ndata: '
+             b'{"type":"message_start","message":{"usage":{"input_tokens":0}}}\n\n')
+    out = L._inject_usage_into_message_start(chunk, 538)
+    assert out is not None
+    assert b'"input_tokens": 538' in out
+    assert out.startswith(b'event: message_start')
+
+
+def test_inject_usage_returns_none_for_non_message_start_bytes():
+    chunk = b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"hi"}}\n\n'
+    assert L._inject_usage_into_message_start(chunk, 538) is None
+
+
+def test_inject_usage_returns_none_for_unparseable_data():
+    chunk = b'event: message_start\ndata: {not json}\n\n'
+    assert L._inject_usage_into_message_start(chunk, 538) is None
+
+
+def test_inject_usage_rewrites_dict_message_start():
+    chunk = {"type": "message_start", "message": {"usage": {"input_tokens": 0}}}
+    out = L._inject_usage_into_message_start(chunk, 15)
+    assert out["message"]["usage"]["input_tokens"] == 15
+
+
+def test_inject_usage_returns_none_for_non_dict_non_bytes():
+    assert L._inject_usage_into_message_start(123, 538) is None
+
+
+def test_log_pre_api_call_stashes_count(monkeypatch):
+    monkeypatch.setattr(L, "_preflight_input_tokens_sync", lambda **kw: 538)
+    h = L.Handler()
+    cid = "call-abc"
+    kwargs = {"call_type": "anthropic_messages", "stream": True, "litellm_call_id": cid,
+              "additional_args": {"complete_input_dict": {
+                  "model": "qwen3.6-35b-a3b", "messages": [{"role": "user", "content": "hi"}],
+                  "tools": [], "chat_template_kwargs": {"preserve_thinking": False}}}}
+    try:
+        h.log_pre_api_call("qwen3.6-35b-a3b", [], kwargs)
+        assert L._USAGE_INJECT.get(cid) == 538
+    finally:
+        L._USAGE_INJECT.pop(cid, None)
+
+
+def test_log_pre_api_call_skips_wrong_call_type(monkeypatch):
+    monkeypatch.setattr(L, "_preflight_input_tokens_sync", lambda **kw: 999)
+    h = L.Handler()
+    kwargs = {"call_type": "acompletion", "stream": True, "litellm_call_id": "x",
+              "additional_args": {"complete_input_dict": {"model": "qwen3.6-35b-a3b",
+                "messages": [{"role": "user", "content": "hi"}]}}}
+    h.log_pre_api_call("qwen3.6-35b-a3b", [], kwargs)
+    assert "x" not in L._USAGE_INJECT
+
+
+def test_log_pre_api_call_skips_non_stream(monkeypatch):
+    monkeypatch.setattr(L, "_preflight_input_tokens_sync", lambda **kw: 999)
+    h = L.Handler()
+    kwargs = {"call_type": "anthropic_messages", "stream": False, "litellm_call_id": "x",
+              "additional_args": {"complete_input_dict": {"model": "qwen3.6-35b-a3b",
+                "messages": [{"role": "user", "content": "hi"}]}}}
+    h.log_pre_api_call("qwen3.6-35b-a3b", [], kwargs)
+    assert "x" not in L._USAGE_INJECT
+
+
+def test_log_pre_api_call_skips_when_disabled(monkeypatch):
+    monkeypatch.setattr(L, "INJECT_STREAMED_USAGE", False)
+    monkeypatch.setattr(L, "_preflight_input_tokens_sync", lambda **kw: 999)
+    h = L.Handler()
+    kwargs = {"call_type": "anthropic_messages", "stream": True, "litellm_call_id": "x",
+              "additional_args": {"complete_input_dict": {"model": "qwen3.6-35b-a3b",
+                "messages": [{"role": "user", "content": "hi"}]}}}
+    h.log_pre_api_call("qwen3.6-35b-a3b", [], kwargs)
+    assert "x" not in L._USAGE_INJECT
+
+
+def test_log_pre_api_call_skips_when_preflight_returns_none(monkeypatch):
+    monkeypatch.setattr(L, "_preflight_input_tokens_sync", lambda **kw: None)
+    h = L.Handler()
+    kwargs = {"call_type": "anthropic_messages", "stream": True, "litellm_call_id": "x",
+              "additional_args": {"complete_input_dict": {"model": "qwen3.6-35b-a3b",
+                "messages": [{"role": "user", "content": "hi"}]}}}
+    h.log_pre_api_call("qwen3.6-35b-a3b", [], kwargs)
+    assert "x" not in L._USAGE_INJECT
+
+
+async def _agen(chunks):
+    for c in chunks:
+        yield c
+
+
+async def test_iterator_hook_injects_first_message_start_and_pops_stash():
+    h = L.Handler()
+    cid = "call-xyz"
+    L._USAGE_INJECT[cid] = 538
+    chunks = [
+        b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":0}}}\n\n',
+        b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"hi"}}\n\n',
+    ]
+    out = []
+    async for c in h.async_post_call_streaming_iterator_hook(None, _agen(chunks), {"litellm_call_id": cid}):
+        out.append(c)
+    assert b'"input_tokens": 538' in out[0]
+    assert out[1] == chunks[1]            # subsequent chunk passes through unchanged
+    assert cid not in L._USAGE_INJECT     # stash popped
+
+
+async def test_iterator_hook_no_stash_passes_through():
+    h = L.Handler()
+    chunk = b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":0}}}\n\n'
+    out = []
+    async for c in h.async_post_call_streaming_iterator_hook(None, _agen([chunk]), {"litellm_call_id": "nope"}):
+        out.append(c)
+    assert out[0] == chunk                # unchanged when no stash entry

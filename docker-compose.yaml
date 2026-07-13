@@ -115,6 +115,7 @@ services:
       LITELLM_WORKER_STARTUP_HOOKS: litellm_callbacks:start_background_tasks
       PYTHONPATH: /app
       CLAUDE_QWEN_MAX_TOKENS_CAP: "8192"   # server-side clamp (dense 64k ctx): PCT80 -> cap <= 12800
+      CLAUDE_QWEN_INJECT_STREAMED_USAGE: "1"   # preflight /tokenize -> message_start.input_tokens (auto-compact)
       SEARXNG_API_BASE: http://searxng:8080   # SearXNG instance for websearch_interception (searxng provider)
     volumes:
       - ./litellm_config.yaml:/app/litellm_config.yaml:ro
