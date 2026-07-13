@@ -250,6 +250,31 @@ def test_inject_usage_rewrites_bytes_message_start():
     assert out.startswith(b'event: message_start')
 
 
+def test_inject_usage_rewrites_message_start_coalesced_after_ping():
+    # A single yielded chunk may carry multiple SSE events (ping then message_start).
+    # The rewriter must scan past the ping's data line and rewrite message_start,
+    # not bail on the first data line. Regression guard for the silent-miss path.
+    chunk = (
+        b'event: ping\ndata: {"type":"ping"}\n\n'
+        b'event: message_start\ndata: '
+        b'{"type":"message_start","message":{"usage":{"input_tokens":0}}}\n\n'
+    )
+    out = L._inject_usage_into_message_start(chunk, 538)
+    assert out is not None
+    assert b'"input_tokens": 538' in out
+    # The ping frame is preserved verbatim; message_start is the rewritten one.
+    assert b'event: ping\ndata: {"type":"ping"}\n\n' in out
+    assert out.count(b'"type": "message_start"') == 1
+
+
+def test_inject_usage_preserves_sse_framing():
+    # The split/join must preserve the trailing \n\n that delimits SSE frames.
+    chunk = (b'event: message_start\ndata: '
+             b'{"type":"message_start","message":{"usage":{"input_tokens":0}}}\n\n')
+    out = L._inject_usage_into_message_start(chunk, 538)
+    assert out is not None and out.endswith(b"\n\n")
+
+
 def test_inject_usage_returns_none_for_non_message_start_bytes():
     chunk = b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"hi"}}\n\n'
     assert L._inject_usage_into_message_start(chunk, 538) is None

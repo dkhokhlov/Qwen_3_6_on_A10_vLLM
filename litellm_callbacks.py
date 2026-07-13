@@ -285,14 +285,25 @@ def _inject_usage_into_message_start(chunk, count: int):
     if '"message_start"' not in text:
         return None
     lines = text.split("\n")
-    data_idx = next((i for i, ln in enumerate(lines) if ln.startswith("data: ")), None)
-    if data_idx is None:
-        return None
-    try:
-        obj = json.loads(lines[data_idx][6:])
-    except (ValueError, TypeError):
-        return None
-    if obj.get("type") != "message_start":
+    # Scan EVERY `data:` line, not just the first. A chunk may carry multiple SSE
+    # events (e.g. a `ping` frame followed by `message_start` in the same yielded
+    # payload); grabbing the first `data:` line would match the ping's
+    # {"type":"ping"}, bail, and silently drop the count -> auto-compact never
+    # fires (the exact regression this fixes). Find the message_start frame
+    # wherever it sits and rewrite that line alone.
+    msg_idx = None
+    obj = None
+    for i, ln in enumerate(lines):
+        if not ln.startswith("data: "):
+            continue
+        try:
+            cand = json.loads(ln[6:])
+        except (ValueError, TypeError):
+            continue
+        if isinstance(cand, dict) and cand.get("type") == "message_start":
+            msg_idx, obj = i, cand
+            break
+    if obj is None:
         return None
     msg = obj.get("message")
     if not isinstance(msg, dict):
@@ -304,7 +315,7 @@ def _inject_usage_into_message_start(chunk, count: int):
     usage["input_tokens"] = count
     # Match LiteLLM's separators (", " / ": ") so the frame shape is stable; clients
     # parse the JSON, so the whitespace is not semantically load-bearing.
-    lines[data_idx] = "data: " + json.dumps(obj, separators=(", ", ": "))
+    lines[msg_idx] = "data: " + json.dumps(obj, separators=(", ", ": "))
     out = "\n".join(lines)
     return out.encode("utf-8") if was_bytes else out
 
