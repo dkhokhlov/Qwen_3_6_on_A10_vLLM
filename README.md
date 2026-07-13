@@ -1226,13 +1226,17 @@ global-`true`-alone, which strips `context_management` to null. This is the beha
 claude's own auto-compact cannot provide (one fire per session).
 
 **Known limitation — summarization sub-call headroom.** The polyfill's summarization
-sub-call requests a hardcoded `max_tokens=4096` **on top of** the full history. So the
-history at fire time must satisfy `history + 4096 + prompt < --max-model-len` (128K MoE
-/ 64K dense). The default thresholds (90000 / 50000) leave enough headroom for
-**gradual** per-turn growth (90K + 4096 + prompt ≈ 94K < 128K). A single turn that jumps
-context to >~123K (MoE) / >~59K (dense) overflows the summary call → the polyfill fails
-→ the main call 400s. This is an inherent polyfill limitation, not a code bug; it does
-not affect the normal growth pattern where context crosses the threshold incrementally.
+sub-call requests a `max_tokens` of `context_management_summary_max_tokens` (default
+4096) **on top of** the full history. So the history at fire time must satisfy
+`history + summary_max_tokens + prompt < --max-model-len` (128K MoE / 64K dense). The
+default thresholds (90000 / 50000) leave enough headroom for **gradual** per-turn growth
+(90K + 4096 + prompt ≈ 94K < 128K). A single turn that jumps context to >~123K (MoE) /
+>~61.5K (dense) overflows the summary call → the polyfill fails → the main call 400s.
+This is an inherent polyfill limitation, not a code bug; it does not affect the normal
+growth pattern where context crosses the threshold incrementally. The dense stack
+overrides `context_management_summary_max_tokens: 2048` (vs the 4096 default) to push
+its overflow point up by ~2K (50K + 2048 vs 50K + 4096) for the single-big-turn edge
+case; MoE keeps the 4096 default (34K+ of margin).
 
 **TODO — verify the fix in claude code.** To confirm repeated proxy-side compaction
 works end-to-end on this stack, run the checked-in probe (an integration test, skipped
