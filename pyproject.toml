@@ -8,6 +8,7 @@ addopts = "--strict-markers --strict-config -ra --cov=litellm_callbacks --cov=sc
 markers = [
     "unit: fast, hermetic unit + config tests (no GPU/docker)",
     "integration: long tests against the live stack (needs `make start35` + GPU)",
+    "live_compaction_probe: ~10-15 min live compaction probe (env-gated RUN_LIVE_COMPACTION_PROBE=1; skipped by default)",
 ]
 
 [tool.coverage.run]

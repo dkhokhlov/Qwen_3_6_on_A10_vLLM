@@ -58,7 +58,7 @@ litellm_settings:
   # No master_key -> auth is OFF and :4000 is bound 0.0.0.0, so any network host
   # can call the proxy (operator's explicit choice; see README Security).
   # open-webui and the bench need no API key; Claude Code sends a placeholder token.
-  drop_params: true                       # drop Claude Code params vLLM rejects -> no 400s
+  drop_params: false                      # un-gate the compact_20260112 polyfill (it short-circuits to no-op when drop_params is truthy). Safe: litellm's anthropic->openai conversion handles every claude-code param (verified live on the moe stack; same conversion path here). The polyfill only RUNS when `context_management` is present (the opt-in injection in litellm_callbacks.async_pre_request_hook), so un-gating is harmless for non-opt-in traffic.
   request_timeout: 600                    # generous; cold wake happens in the middleware
   num_workers: 1                          # one idle-watcher, one wake-lock owner
   # WebSearch interception (built-in callback; needs LiteLLM >= v1.78.7). Server-side:
@@ -74,6 +74,15 @@ litellm_settings:
   callbacks: ["websearch_interception"]
   websearch_interception_params:
     enabled_providers: [hosted_vllm]   # Qwen-only; the real claude (-> Anthropic) never hits this proxy
+
+general_settings:
+  # Required by the compact_20260112 polyfill (plan B proxy-side compaction). If unset,
+  # the polyfill runs but the edit errors inline `summary_model_not_configured` and
+  # silently no-ops -- NOT an HTTP 400, a footgun (verified). The -nothink flavor is the
+  # cheap summarizer (no reasoning pass); the summary call is a router /v1/chat/completions
+  # acompletion, a different path, so no polyfill recursion. See litellm_callbacks.py
+  # (CLAUDE_QWEN_PROXY_COMPACT) + the async_pre_request_hook that injects context_management.
+  context_management_summary_model: qwen3.6-27b-nothink
 
 # Search backend for websearch_interception: self-hosted SearXNG (DuckDuckGo engine),
 # keyless. SEARXNG_API_BASE is set on the litellm compose service (http://searxng:8080).

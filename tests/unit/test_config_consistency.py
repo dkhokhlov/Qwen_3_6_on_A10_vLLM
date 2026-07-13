@@ -186,10 +186,52 @@ def test_vllm_and_litellm_publish_on_all_interfaces(compose_p, litellm_p, base):
 
 
 @pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
-def test_litellm_settings_drops_params_and_runs_one_worker(compose_p, litellm_p, base):
+def test_litellm_settings_ungates_polyfill_and_runs_one_worker(compose_p, litellm_p, base):
     s = _load(litellm_p)["litellm_settings"]
-    assert s["drop_params"] is True   # drop Claude Code params vLLM rejects -> no 400s
+    # drop_params MUST be false: the compact_20260112 polyfill (plan B proxy-side
+    # compaction) short-circuits to no-op when drop_params is truthy. Safe -- litellm's
+    # anthropic->openai conversion handles every claude-code param (verified live: real
+    # `claude -p` with the ~28k-token tools schema -> 200, no 400); the polyfill only RUNS
+    # when `context_management` is present (the opt-in injection), so un-gating is
+    # harmless for non-opt-in traffic.
+    assert s["drop_params"] is False
     assert s["num_workers"] == 1      # one idle-watcher, one wake-lock owner
+
+
+@pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
+def test_context_management_summary_model_present(compose_p, litellm_p, base):
+    # The compact_20260112 polyfill requires general_settings.context_management_summary_model
+    # or it errors inline `summary_model_not_configured` and silently no-ops (NOT an HTTP
+    # 400 -- a footgun, verified). Must be the -nothink flavor (cheap summarizer, no
+    # reasoning pass) and a name in model_list (the summary call routes through the proxy).
+    litellm = _load(litellm_p)
+    names = {m["model_name"] for m in litellm["model_list"]}
+    sm = litellm.get("general_settings", {}).get("context_management_summary_model")
+    assert sm == f"{base}-nothink", f"summary_model must be {base}-nothink, got {sm!r}"
+    assert sm in names, f"summary_model {sm!r} not in litellm model_list {names}"
+
+
+@pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
+def test_proxy_compact_env_present_and_off(compose_p, litellm_p, base):
+    # CLAUDE_QWEN_PROXY_COMPACT gates the opt-in proxy-side compaction injection. Default
+    # "0" (off): claude's own auto-compact handles the first crossing; the polyfill is for
+    # workloads that need REPEATED compaction past claude's per-session breaker. The
+    # threshold must satisfy the polyfill minimum (>=50000) AND fit under vLLM's
+    # --max-model-len with headroom for the summarization sub-call (history + cap + prompt),
+    # else it never fires or the summary call overflows.
+    env = _load(compose_p)["services"]["litellm"]["environment"]
+    assert env.get("CLAUDE_QWEN_PROXY_COMPACT") == "0", (
+        'CLAUDE_QWEN_PROXY_COMPACT must default to "0" (off); opt in by setting "1"'
+    )
+    thr = int(env["CLAUDE_QWEN_PROXY_COMPACT_THRESHOLD"])
+    assert thr >= 50000, f"polyfill requires trigger >= 50000, got {thr}"
+    window = int(_flag(_cmd_tokens(_load(compose_p)), "--max-model-len"))
+    cap = int(env["CLAUDE_QWEN_MAX_TOKENS_CAP"])
+    # summarization sub-call = history(~thr) + summary output(<=cap) + prompt(~1k) < window
+    assert thr + cap + 1024 < window, (
+        f"{base}: trigger {thr} + cap {cap} + 1k must be < window {window} "
+        "(summarization sub-call must fit under --max-model-len)"
+    )
 
 
 @pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)

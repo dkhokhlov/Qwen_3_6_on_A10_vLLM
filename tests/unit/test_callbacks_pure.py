@@ -354,3 +354,47 @@ async def test_iterator_hook_no_stash_passes_through():
     async for c in h.async_post_call_streaming_iterator_hook(None, _agen([chunk]), {"litellm_call_id": "nope"}):
         out.append(c)
     assert out[0] == chunk                # unchanged when no stash entry
+
+
+# --------------------------------------------------------------------------- #
+# Handler.async_pre_request_hook: opt-in proxy-side compaction (compact_20260112)
+# injection on the /v1/messages pass-through path. Off (default) -> None, no
+# mutation. On -> inject `context_management` and return kwargs (a non-None
+# return REPLACES request_kwargs; the key flows to the polyfill). backend.ensure_up
+# is stubbed here (the wake path is exercised live in the integration probe).
+# --------------------------------------------------------------------------- #
+async def _noop_ensure_up():
+    return None
+
+
+async def test_pre_request_hook_off_returns_none_and_does_not_mutate(monkeypatch):
+    monkeypatch.setattr(L.backend, "ensure_up", _noop_ensure_up)
+    monkeypatch.setattr(L, "PROXY_COMPACT", False)
+    h = L.Handler()
+    kwargs = {"model": "qwen3.6-35b-a3b", "messages": [{"role": "user", "content": "hi"}]}
+    out = await h.async_pre_request_hook(kwargs["model"], kwargs["messages"], kwargs)
+    assert out is None
+    assert "context_management" not in kwargs   # no in-place mutation when off
+
+
+async def test_pre_request_hook_on_injects_context_management(monkeypatch):
+    monkeypatch.setattr(L.backend, "ensure_up", _noop_ensure_up)
+    monkeypatch.setattr(L, "PROXY_COMPACT", True)
+    monkeypatch.setattr(L, "PROXY_COMPACT_THRESHOLD", 90000)
+    h = L.Handler()
+    kwargs = {"model": "qwen3.6-35b-a3b", "messages": [{"role": "user", "content": "hi"}]}
+    out = await h.async_pre_request_hook(kwargs["model"], kwargs["messages"], kwargs)
+    assert out is kwargs                      # returns the full request_kwargs (replaces)
+    edit = out["context_management"]["edits"][0]
+    assert edit["type"] == "compact_20260112"
+    assert edit["trigger"] == {"type": "input_tokens", "value": 90000}
+
+
+async def test_pre_request_hook_threshold_env_drives_value(monkeypatch):
+    monkeypatch.setattr(L.backend, "ensure_up", _noop_ensure_up)
+    monkeypatch.setattr(L, "PROXY_COMPACT", True)
+    monkeypatch.setattr(L, "PROXY_COMPACT_THRESHOLD", 123456)
+    h = L.Handler()
+    kwargs = {"model": "qwen3.6-27b", "messages": []}
+    out = await h.async_pre_request_hook("qwen3.6-27b", [], kwargs)
+    assert out["context_management"]["edits"][0]["trigger"]["value"] == 123456

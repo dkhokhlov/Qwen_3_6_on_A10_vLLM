@@ -106,6 +106,30 @@ MAX_TOKENS_CAP = int(os.environ.get("CLAUDE_QWEN_MAX_TOKENS_CAP", "16384"))
 INJECT_STREAMED_USAGE = os.environ.get(
     "CLAUDE_QWEN_INJECT_STREAMED_USAGE", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
+
+# Opt-in PROXY-SIDE compaction via LiteLLM's compact_20260112 polyfill (plan B).
+# Claude Code's proactive auto-compact fires once per session then dies on a
+# per-session breaker (hasAttemptedReactiveCompact, not proxy-fixable); for long
+# sessions that need REPEATED compaction, the polyfill rewrites messages
+# server-side on every threshold crossing -- transparent to claude (no
+# compact_boundary), so it bypasses the breaker. Coheres with the usage fix above:
+# the polyfill rewrites messages BEFORE vLLM, so log_pre_api_call's /tokenize
+# preflight counts the POST-compact messages and the injected message_start
+# usage resets claude's tracker (repeat). The async_pre_request_hook injects
+# `context_management` on the /v1/messages pass-through path when this is on;
+# off (default) -> hook returns None, zero change. The polyfill gate reads
+# drop_params (truthy -> no-op), so litellm_settings.drop_params must be false
+# (see litellm_config.*.yaml); the polyfill only RUNS when context_management is
+# present, so un-gating is harmless for non-opt-in traffic. Requires
+# general_settings.context_management_summary_model (else the polyfill errors
+# inline `summary_model_not_configured` and silently no-ops -- not an HTTP 400).
+PROXY_COMPACT = os.environ.get(
+    "CLAUDE_QWEN_PROXY_COMPACT", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+# input-token trigger; polyfill requires >= 50000 (else AnthropicContextManagementError
+# 400). 90000 default: below claude's T4 (~98616) so the polyfill fires first/repeats,
+# with headroom for the summarization sub-call to fit (90k + ~16k + ~1k < 128k).
+PROXY_COMPACT_THRESHOLD = int(os.environ.get("CLAUDE_QWEN_PROXY_COMPACT_THRESHOLD", "90000"))
 # litellm_call_id -> preflight input-token count. Set in async_pre_call_deployment_hook,
 # consumed+popped in async_post_call_streaming_iterator_hook. litellm_call_id is the same
 # value at both hooks (self.data flows to kwargs and to request_data -- see plan).
@@ -465,9 +489,29 @@ class Handler(CustomLogger):
         return None
 
     # Pass-through path: /v1/messages (anthropic_messages -> _execute_pre_request_hooks).
+    # Wakes the backend, and when PROXY_COMPACT is on, injects `context_management`
+    # (compact_20260112) so LiteLLM's in-gateway polyfill rewrites messages above
+    # PROXY_COMPACT_THRESHOLD input tokens. Returning kwargs (the same dict, with the
+    # key added) REPLACES request_kwargs outright (a None return leaves it unmodified);
+    # the key flows kwargs.update -> adapter kwargs.pop("context_management") -> polyfill,
+    # which runs BEFORE the upstream vLLM call. The polyfill only fires when this key is
+    # present, so opt-in off (default) -> None -> zero change. See module docstring +
+    # the PROXY_COMPACT env comment above.
     async def async_pre_request_hook(self, model, messages, kwargs):
         await backend.ensure_up()
-        return None
+        if not PROXY_COMPACT:
+            return None
+        kwargs["context_management"] = {
+            "edits": [{
+                "type": "compact_20260112",
+                "trigger": {"type": "input_tokens", "value": PROXY_COMPACT_THRESHOLD},
+            }]
+        }
+        log.info(
+            "proxy-compact: injected context_management trigger=%d model=%s",
+            PROXY_COMPACT_THRESHOLD, model,
+        )
+        return kwargs
 
     # Both endpoints, after Anthropic->OpenAI conversion. The qwen3 template renders
     # PRIOR reasoning only from `reasoning_content`; the adapter attaches Anthropic
