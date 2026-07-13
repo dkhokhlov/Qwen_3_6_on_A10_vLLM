@@ -1215,9 +1215,10 @@ context to >~123K (MoE) / >~59K (dense) overflows the summary call → the polyf
 → the main call 400s. This is an inherent polyfill limitation, not a code bug; it does
 not affect the normal growth pattern where context crosses the threshold incrementally.
 
-**Probe it yourself.** The probe is checked in as an integration test, skipped by default
-even under `make test-integration` (env-gated, ~10–15 min, needs the stack up with
-`CLAUDE_QWEN_PROXY_COMPACT=1`):
+**TODO — verify the fix in claude code.** To confirm repeated proxy-side compaction
+works end-to-end on this stack, run the checked-in probe (an integration test, skipped
+by default even under `make test-integration`; env-gated, ~10–15 min, needs the stack up
+with `CLAUDE_QWEN_PROXY_COMPACT=1`):
 
 ```
 RUN_LIVE_COMPACTION_PROBE=1 python3 -m pytest tests/integration/test_compaction_probe.py -m integration -o addopts="" -s
