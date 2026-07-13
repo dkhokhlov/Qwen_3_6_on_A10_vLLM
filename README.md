@@ -53,6 +53,7 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 - [Experiments that did NOT work](#experiments-that-did-not-work-do-not-retry-without-reason)
 - [Hardware ceiling facts](#hardware-ceiling-facts)
 - [Auto-compaction on the Qwen proxy](#auto-compaction-on-the-qwen-proxy)
+- [Proxy-side compaction (repeated, past the per-session breaker)](#proxy-side-compaction-repeated-past-the-per-session-breaker)
 - [Gotchas](#gotchas)
 
 **Part 4 — Scaling Beyond One A10**
@@ -1051,8 +1052,8 @@ per `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`). That running count is grown from the
 `result.usage`. The LiteLLM→vLLM proxy hardcodes `message_start.usage.input_tokens: 0`
 (the real count arrives only in the terminal `message_delta`, because vLLM, like OpenAI,
 emits usage in the final streaming chunk), so Claude Code's tracker stays at 0, the
-threshold is never crossed, and compaction **never fires** — context grows unbounded
-until a 400 `ContextWindowExceeded`. This is why the window/cap fix alone
+threshold is never crossed, and compaction **never fires (without the usage fix below)** —
+context grows unbounded until a 400 `ContextWindowExceeded`. This is why the window/cap fix alone
 (`CLAUDE_CODE_AUTO_COMPACT_WINDOW` + `CLAUDE_QWEN_MAX_TOKENS_CAP`) is necessary but not
 sufficient: it sizes the window and caps output, but compaction still will not fire until
 the proxy reports accurate streamed usage. (The `~/bin/glm` wrapper works because z.ai's
@@ -1118,7 +1119,8 @@ the same value at both hooks (the nested inner `acompletion` reuses the outer ca
  │          ▼   event: message_start\ndata: {… "usage": {…}}            │
  └─────────────────────────┬─────────────────────────────────────────────┘
                            ▼
-        Claude Code   tracker grows → crosses ~80% → compact_boundary fires
+        Claude Code   tracker grows → crosses window − max_output − 13K (~98K at WINDOW=128000;
+                       PCT override ignored for gateway models) → compact_boundary fires
 ```
 
 Verified live (MoE stack, claude 2.1.193 via `/v1/messages`):
@@ -1126,11 +1128,104 @@ Verified live (MoE stack, claude 2.1.193 via `/v1/messages`):
 - 4-tool request: `message_start.input_tokens` 0 → **538**; terminal `message_delta` 538 (exact).
 - no-tools request: 0 → **15**; terminal 15 (exact).
 - Same `litellm_call_id` at `log_pre_api_call` and the iterator hook → injection fires.
+- **Compaction now fires.** A `WINDOW=128000` probe growing context ~12K/turn produced a
+  `compact_boundary` event (`compactMetadata.trigger="auto"`, `preTokens=98453`,
+  `postTokens=13629` — 87% reduction, 61s) at the `window − max_output − 13K` threshold
+  (128000 − 16384 − 13000 = 98616). The `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80` did **not**
+  scale it (fired at the unscaled value) — the override is ignored for gateway models; the
+  `~70%` glm figure is not reproduced here. The prior "compaction never fires" symptom was
+  the zero-streamed-usage bug, not a separate dispatch failure.
+
+  **Known limitation — one compaction per session.** Claude Code gates proactive
+  compaction behind a per-session breaker (`hasAttemptedReactiveCompact`); after the first
+  `compact_boundary` it does not fire again even on subsequent threshold crossings (the
+  session eventually 400s at the 128K wall if it regrows past). This is a claude-code
+  internal, not proxy-fixable, and it persists across `--resume`. The fix above gives one
+  ~85K-token reset per session (98K→13K) — a large improvement over "never fires." For
+  workloads that need **repeated** proxy-side compaction across that boundary, an opt-in
+  `compact_20260112` polyfill in LiteLLM bypasses the claude-code breaker server-side —
+  see [Proxy-side compaction](#proxy-side-compaction-repeated-past-the-per-session-breaker)
+  below.
 
 To disable (revert to the zero-streamed-usage behavior, e.g. to debug compaction):
 set `CLAUDE_QWEN_INJECT_STREAMED_USAGE=0` in the litellm compose env and recreate the
 litellm container (`make start35` / `make start`, or `docker compose -f
 docker-compose.moe.yaml up -d --force-recreate litellm` to keep vLLM warm).
+
+### Proxy-side compaction (repeated, past the per-session breaker)
+
+The usage fix above makes claude's own auto-compact fire **once** per session. For long
+sessions that regrow past the first reset, claude's per-session breaker
+(`hasAttemptedReactiveCompact`) then blocks any further proactive compaction and the
+session eventually 400s at the `--max-model-len` wall. The opt-in **proxy-side
+compaction** is a server-side workaround that fires on **every** threshold crossing, not
+just the first — it is not gated by claude's breaker because it runs entirely inside
+LiteLLM, transparent to the client (no `compact_boundary` event is ever emitted).
+
+**How it works.** LiteLLM `main-stable` ships an Anthropic-style `context_management`
+edit (`compact_20260112`) with an in-gateway polyfill that runs across all providers,
+including `hosted_vllm`: count the request's input tokens, and if they exceed the
+trigger, call a separate summarizer model with the full history + a summarization prompt,
+then inject the summary as a system prefix and strip the old messages — all before the
+main call reaches vLLM. The `async_pre_request_hook` in `litellm_callbacks.py` injects
+the `context_management` spec on the `/v1/messages` pass-through path when the opt-in env
+is on. Because the rewrite happens before our `log_pre_api_call` `/tokenize` preflight,
+the injected `message_start.usage.input_tokens` reflects the **post-compact** count, so
+claude's tracker resets each cycle — the same mechanism as outcome A, repeated.
+
+**Opt-in env (litellm service, `docker-compose.{,moe.}yaml`):**
+
+| env | default | meaning |
+|---|---|---|
+| `CLAUDE_QWEN_PROXY_COMPACT` | `0` (off) | `1` injects `context_management` on `/v1/messages` for repeated server-side compaction. |
+| `CLAUDE_QWEN_PROXY_COMPACT_THRESHOLD` | `90000` (MoE) / `50000` (dense) | input-token trigger. `≥ 50000` is the polyfill minimum. |
+
+To enable: set `CLAUDE_QWEN_PROXY_COMPACT: "1"` and recreate litellm (`make start35` /
+`make start`). Off by default — the usage fix (one compaction per session) stays the
+default behavior; this layer is for workloads that need repeats.
+
+**Requirements already wired into the configs (both stacks):**
+
+- `general_settings.context_management_summary_model` must be set, else the polyfill
+  **silently no-ops** (`applied_edits[0].error = "summary_model_not_configured"` — not an
+  HTTP error, a footgun). Set to `qwen3.6-35b-a3b-nothink` (MoE) / `qwen3.6-27b-nothink`
+  (dense): a cheap summarizer already in `model_list`. The summary call is a router
+  `acompletion` on a different path, so it does not recurse into the polyfill.
+- `litellm_settings.drop_params: false`. `drop_params: true` (the previous setting, which
+  drops claude-code params vLLM rejects to avoid 400s) **short-circuits the polyfill to
+  no-op** — the polyfill gate reads `effective_drop_params` and bails. Flipping to
+  `false` un-gates it. Verified safe on a real `claude -p` request (full ~28K-token tools
+  schema + thinking + `cache_control` + `top_k` + `stop_sequences` + beta headers → 200,
+  no 400): LiteLLM's anthropic→openAI conversion handles everything, so no
+  `additional_drop_params` list is needed. The config-consistency test guards this.
+
+**Verified.** A clean isolation probe (`WINDOW=1000000` so claude's own T4 threshold is
+unreachable — only the polyfill can fire; `~18K`-token user turns, 12 turns) produced
+**two** repeated proxy-side compactions (turn 5: 95196→48556; turn 9: 93160→48635), each
+with a vLLM summarization burst, `compact=False` throughout (transparent), no 400, no
+timeout. claude's tracker reset at each cycle. This is the behavior claude's own
+auto-compact cannot provide (one fire per session).
+
+**Known limitation — summarization sub-call headroom.** The polyfill's summarization
+sub-call requests a hardcoded `max_tokens=4096` **on top of** the full history. So the
+history at fire time must satisfy `history + 4096 + prompt < --max-model-len` (128K MoE
+/ 64K dense). The default thresholds (90000 / 50000) leave enough headroom for
+**gradual** per-turn growth (90K + 4096 + prompt ≈ 94K < 128K). A single turn that jumps
+context to >~123K (MoE) / >~59K (dense) overflows the summary call → the polyfill fails
+→ the main call 400s. This is an inherent polyfill limitation, not a code bug; it does
+not affect the normal growth pattern where context crosses the threshold incrementally.
+
+**Probe it yourself.** The probe is checked in as an integration test, skipped by default
+even under `make test-integration` (env-gated, ~10–15 min, needs the stack up with
+`CLAUDE_QWEN_PROXY_COMPACT=1`):
+
+```
+RUN_LIVE_COMPACTION_PROBE=1 python3 -m pytest tests/integration/test_compaction_probe.py -m integration -o addopts="" -s
+```
+
+This is a **temporary layer** intended to be removed once claude-code lifts the
+per-session breaker upstream; until then it is the only way to get repeated compaction
+on this proxy.
 
 ---
 
