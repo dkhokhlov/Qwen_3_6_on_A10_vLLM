@@ -246,11 +246,16 @@ def test_proxy_compact_env_present_and_off(compose_p, litellm_p, base):
     thr = int(env["CLAUDE_QWEN_PROXY_COMPACT_THRESHOLD"])
     assert thr >= 50000, f"polyfill requires trigger >= 50000, got {thr}"
     window = int(_flag(_cmd_tokens(_load(compose_p)), "--max-model-len"))
-    cap = int(env["CLAUDE_QWEN_MAX_TOKENS_CAP"])
-    # summarization sub-call = history(~thr) + summary output(<=cap) + prompt(~1k) < window
-    assert thr + cap + 1024 < window, (
-        f"{base}: trigger {thr} + cap {cap} + 1k must be < window {window} "
-        "(summarization sub-call must fit under --max-model-len)"
+    # The summary sub-call's output budget is context_management_summary_max_tokens
+    # (polyfill default 4096; dense overrides to 2048 via M8), NOT CLAUDE_QWEN_MAX_TOKENS_CAP
+    # (that is the MAIN call's cap). The sub-call must fit: history(~thr) + summary output
+    # (<=summary_max_tokens) + prompt(~1k) < --max-model-len. Guarding the real value catches
+    # a too-large override the old cap-based assertion missed.
+    gs = _load(litellm_p).get("general_settings", {})
+    summary_max = int(gs.get("context_management_summary_max_tokens", 4096))  # polyfill default
+    assert thr + summary_max + 1024 < window, (
+        f"{base}: trigger {thr} + summary_max_tokens {summary_max} + ~1k prompt must be "
+        f"< window {window} (summarization sub-call must fit under --max-model-len)"
     )
 
 
