@@ -525,6 +525,15 @@ class Handler(CustomLogger):
         await backend.ensure_up()
         if not PROXY_COMPACT:
             return None
+        # Path guard (defensive): this hook fires ONLY on the anthropic /v1/messages
+        # pass-through (anthropic_messages route). /v1/messages/count_tokens calls
+        # internal_token_counter directly and never reaches _execute_pre_request_hooks;
+        # /v1/chat/completions dispatches async_pre_call_hook (the router hook), not this
+        # one. The polyfill also can't summarize an empty conversation, so skip injection
+        # when there are no messages -- never inject context_management (nor the
+        # per-request drop_params=False) onto a non-generation request.
+        if not messages:
+            return None
         # Append the compact edit to an existing context_management.edits list (preserve a
         # client-supplied spec -- another compact trigger, a clear_tool_uses edit, etc.) --
         # do NOT clobber it. Malformed/absent -> create a fresh {"edits": [compact]}. The
