@@ -38,6 +38,7 @@ import urllib.request
 
 BASE_URL = os.environ.get("PROBE_BASE_URL", "http://localhost:4000")
 VLLM_METRICS = os.environ.get("PROBE_VLLM_METRICS", "http://localhost:8000/metrics")
+LITELLM_CONTAINER = os.environ.get("PROBE_LITELLM_CONTAINER", "vllm-litellm35b")
 
 
 def _env_for_claude(window: int, pct: int) -> dict:
@@ -75,6 +76,20 @@ def metric() -> float | None:
     except Exception:
         return None
     return None   # readable but no matching line -> unknown, NOT 0.0
+
+
+def litellm_injection_log_count(container: str = LITELLM_CONTAINER) -> int | None:
+    """Count 'proxy-compact: injected context_management' lines in the litellm container's
+    logs -- INDEPENDENT evidence the opt-in injection hook fired on /v1/messages (the hook
+    logs this line on every call when CLAUDE_QWEN_PROXY_COMPACT=1). Returns None if docker
+    isn't reachable from the probe host, so the caller can skip the check rather than fail
+    on an environment limitation."""
+    try:
+        out = subprocess.run(["docker", "logs", container], capture_output=True,
+                             text=True, timeout=15)
+        return out.stdout.count("proxy-compact: injected context_management")
+    except Exception:
+        return None
 
 
 def blob(n_tokens: int) -> str:

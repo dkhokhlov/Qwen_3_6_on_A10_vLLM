@@ -39,3 +39,27 @@ def test_metric_returns_none_on_exception(monkeypatch):
         P.urllib.request, "urlopen",
         lambda url, timeout=5: (_ for _ in ()).throw(OSError("down")))
     assert P.metric() is None
+
+
+class _CompletedProcess:
+    def __init__(self, stdout): self.stdout = stdout
+
+
+def test_litellm_injection_log_count_counts_matches(monkeypatch):
+    # Independent evidence the opt-in hook fired: count the injection log lines in the
+    # litellm container's stdout. Two matches -> 2.
+    class _R:
+        stdout = ("proxy-compact: injected context_management trigger=90000 drop_params=False model=x\n"
+                  "unrelated line\n"
+                  "proxy-compact: injected context_management trigger=90000 drop_params=False model=y\n")
+    monkeypatch.setattr(P.subprocess, "run", lambda *a, **k: _R())
+    assert P.litellm_injection_log_count() == 2
+
+
+def test_litellm_injection_log_count_none_when_docker_unreachable(monkeypatch):
+    # docker not on PATH / unreachable -> None, so the live test SKIPS the check rather
+    # than failing on an environment limitation.
+    def boom(*a, **k):
+        raise FileNotFoundError("docker")
+    monkeypatch.setattr(P.subprocess, "run", boom)
+    assert P.litellm_injection_log_count() is None
