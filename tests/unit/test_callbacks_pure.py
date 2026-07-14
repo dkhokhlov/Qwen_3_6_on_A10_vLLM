@@ -573,3 +573,53 @@ async def test_pre_request_hook_threshold_env_drives_value(monkeypatch):
     kwargs = {"model": "qwen3.6-27b", "messages": []}
     out = await h.async_pre_request_hook("qwen3.6-27b", [], kwargs)
     assert out["context_management"]["edits"][0]["trigger"]["value"] == 123456
+
+
+async def test_pre_request_hook_appends_compact_to_existing_edits(monkeypatch):
+    # L2: an existing client-supplied context_management must NOT be clobbered. Append the
+    # compact edit to the client's edits list (client edits preserved, compact added).
+    monkeypatch.setattr(L.backend, "ensure_up", _noop_ensure_up)
+    monkeypatch.setattr(L, "PROXY_COMPACT", True)
+    monkeypatch.setattr(L, "PROXY_COMPACT_THRESHOLD", 90000)
+    h = L.Handler()
+    client_edit = {"type": "clear_tool_uses"}
+    kwargs = {"model": "qwen3.6-35b-a3b", "messages": [{"role": "user", "content": "hi"}],
+              "context_management": {"edits": [client_edit]}}
+    out = await h.async_pre_request_hook(kwargs["model"], kwargs["messages"], kwargs)
+    edits = out["context_management"]["edits"]
+    assert edits[0] is client_edit                 # client edit preserved, first
+    assert edits[1]["type"] == "compact_20260112"  # compact appended
+    assert len(edits) == 2
+    assert out["drop_params"] is False             # polyfill still un-gated
+
+
+async def test_pre_request_hook_appends_to_existing_compact_edit(monkeypatch):
+    # A client that already sent a compact edit: ours appends after it (the polyfill runs
+    # both in order; the second sees the already-compacted input and no-ops -- harmless).
+    monkeypatch.setattr(L.backend, "ensure_up", _noop_ensure_up)
+    monkeypatch.setattr(L, "PROXY_COMPACT", True)
+    monkeypatch.setattr(L, "PROXY_COMPACT_THRESHOLD", 90000)
+    h = L.Handler()
+    client_compact = {"type": "compact_20260112",
+                      "trigger": {"type": "input_tokens", "value": 50000}}
+    kwargs = {"model": "qwen3.6-35b-a3b", "messages": [],
+              "context_management": {"edits": [client_compact]}}
+    out = await h.async_pre_request_hook(kwargs["model"], kwargs["messages"], kwargs)
+    edits = out["context_management"]["edits"]
+    assert len(edits) == 2
+    assert edits[0]["trigger"]["value"] == 50000   # client's lower trigger preserved
+    assert edits[1]["trigger"]["value"] == 90000   # ours appended
+
+
+async def test_pre_request_hook_overwrites_malformed_context_management(monkeypatch):
+    # Malformed existing context_management (not a dict-with-edits-list) -> can't append,
+    # so create a fresh spec (overwrite). The else branch.
+    monkeypatch.setattr(L.backend, "ensure_up", _noop_ensure_up)
+    monkeypatch.setattr(L, "PROXY_COMPACT", True)
+    monkeypatch.setattr(L, "PROXY_COMPACT_THRESHOLD", 90000)
+    h = L.Handler()
+    kwargs = {"model": "qwen3.6-35b-a3b", "messages": [], "context_management": "garbage"}
+    out = await h.async_pre_request_hook(kwargs["model"], kwargs["messages"], kwargs)
+    assert out["context_management"] == {"edits": [{
+        "type": "compact_20260112",
+        "trigger": {"type": "input_tokens", "value": 90000}}]}
