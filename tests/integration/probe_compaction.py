@@ -62,15 +62,19 @@ def _env_for_claude(window: int, pct: int) -> dict:
 
 
 def metric() -> float | None:
-    """Cumulative vllm:prompt_tokens_total, or None if /metrics is unreadable (tolerant:
-    vLLM may be idle-stopped at the baseline read)."""
+    """Cumulative vllm:prompt_tokens_total, or None if /metrics is unreadable OR the
+    line is absent (tolerant: vLLM may be idle-stopped at the baseline read, or just
+    woke and served nothing yet). Returns None -- NOT 0.0 -- when the line is absent so
+    callers' `metric() or prev` carry-forward can distinguish "couldn't read" from a real
+    cumulative count (a cumulative counter is never genuinely 0.0 after the first request;
+    conflating absent-with-0.0 masked transient empty reads as delta=0)."""
     try:
         for line in urllib.request.urlopen(VLLM_METRICS, timeout=5).read().decode().splitlines():
             if line.startswith("vllm:prompt_tokens_total{"):
                 return float(line.split()[-1])
     except Exception:
         return None
-    return 0.0
+    return None   # readable but no matching line -> unknown, NOT 0.0
 
 
 def blob(n_tokens: int) -> str:
@@ -124,6 +128,19 @@ def run_probe(window: int, pct: int, turns: int, blob_tokens: int,
     big = blob(blob_tokens)
     records = []
     for t in range(1, turns + 1):
+        if t > 1 and not session_id:
+            # Turn 1 produced no session_id (a claude error shape, not an exception) but
+            # returned ok=True; without a session_id we cannot --resume, and
+            # ["--resume", None] would make subprocess.run raise TypeError (uncaught --
+            # only TimeoutExpired is handled) -> raw traceback. Abort gracefully like a
+            # timeout instead.
+            records.append({"turn": t, "delta": None, "in": None, "out": None,
+                            "cache_r": None, "cache_c": None, "compact": False,
+                            "ok": False, "session_id": session_id,
+                            "stderr": "no session_id from turn 1; cannot resume"})
+            if verbose:
+                print(f"turn {t:2d}: no session_id from turn 1; stopping")
+            break
         args = [] if t == 1 else ["--resume", session_id]
         prompt = "reply with exactly: ok" if t == 1 else (
             f"Here is a document chunk to remember verbatim, then reply with exactly: ok\n\n{big}")
