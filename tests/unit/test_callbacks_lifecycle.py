@@ -8,6 +8,7 @@ deadline is involved) — NO edits to litellm_callbacks.py. The singleton's asyn
 is recreated per test so it binds to each test's own event loop.
 """
 import asyncio
+import logging
 import types
 
 import httpx
@@ -312,7 +313,7 @@ async def test_idle_watch_preserves_state_when_metrics_unreadable(monkeypatch):
 # --------------------------------------------------------------------------- #
 # start_background_tasks (startup hook: registers Handler + spawns lifecycle tasks)
 # --------------------------------------------------------------------------- #
-async def test_start_background_tasks_registers_handler_and_is_idempotent(monkeypatch):
+async def test_start_background_tasks_registers_handler_and_is_idempotent(monkeypatch, caplog):
     import litellm
 
     async def block_forever():
@@ -323,9 +324,13 @@ async def test_start_background_tasks_registers_handler_and_is_idempotent(monkey
 
     before = list(litellm.callbacks)
     try:
-        await L.start_background_tasks()
+        with caplog.at_level(logging.INFO, logger=L.log.name):
+            await L.start_background_tasks()
         assert sum(1 for c in litellm.callbacks if isinstance(c, L.Handler)) == 1
         assert len(L._tasks) == 2
+        # The startup hook runs the dispatch self-check on the registered Handler (wiring
+        # check: start_background_tasks -> _assert_handler_dispatch_wired).
+        assert any("self-check OK" in r.message for r in caplog.records)
 
         await L.start_background_tasks()  # idempotent: no second Handler
         assert sum(1 for c in litellm.callbacks if isinstance(c, L.Handler)) == 1
@@ -336,6 +341,35 @@ async def test_start_background_tasks_registers_handler_and_is_idempotent(monkey
         await asyncio.gather(*tasks, return_exceptions=True)
         L._tasks.clear()
         litellm.callbacks[:] = [c for c in litellm.callbacks if not isinstance(c, L.Handler)]
+
+
+# --------------------------------------------------------------------------- #
+# Dispatch self-check: the registered Handler must expose the hook methods LiteLLM
+# dispatches, else that path silently no-ops (no wake / no injection / no preflight)
+# with no error. Catches a stale single-file bind-mount running an older callbacks.py
+# missing a hook added later (host tests pass; container is stale).
+# --------------------------------------------------------------------------- #
+def test_dispatch_self_check_ok_for_full_handler(caplog):
+    h = L.Handler()
+    with caplog.at_level(logging.INFO, logger=L.log.name):
+        L._assert_handler_dispatch_wired(h)
+    assert any("self-check OK" in r.message for r in caplog.records)
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_dispatch_self_check_logs_error_for_missing_hook(caplog):
+    # Shadow one required hook with a non-callable instance attr -> getattr finds the
+    # instance attr first -> callable() is False -> the self-check must flag it by name
+    # as a loud ERROR (simulates a stale bind-mount missing the hook).
+    h = L.Handler()
+    h.async_pre_request_hook = None
+    with caplog.at_level(logging.ERROR, logger=L.log.name):
+        L._assert_handler_dispatch_wired(h)
+    err = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(err) == 1
+    assert "FAILED" in err[0]
+    assert "async_pre_request_hook" in err[0]
+    assert "stale" in err[0] or "force-recreate" in err[0]
 
 
 # --------------------------------------------------------------------------- #

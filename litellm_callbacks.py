@@ -697,3 +697,35 @@ async def start_background_tasks() -> None:
     if not any(isinstance(c, Handler) for c in litellm.callbacks):
         litellm.callbacks.append(Handler())
         log.info("wake handler registered on litellm.callbacks")
+    # Dispatch self-check: the registered Handler MUST expose the hook methods LiteLLM
+    # dispatches, else that path silently no-ops (no wake / no injection / no preflight)
+    # with no error. Catches a stale single-file bind-mount running an older
+    # callbacks.py missing a hook added later (host tests pass; container is stale --
+    # see the bind-mount stale-inode gotcha). Runs every startup, not just on first
+    # registration, so a re-invocation still checks. Logs OK or a loud ERROR naming the
+    # missing hooks (does not raise -- the proxy still serves, degraded).
+    handler = next((c for c in litellm.callbacks if isinstance(c, Handler)), None)
+    if handler is not None:
+        _assert_handler_dispatch_wired(handler)
+
+
+# Hook methods LiteLLM dispatches on the Handler. A rename or a stale bind-mount leaves
+# the registered instance missing one -> that path silently no-ops.
+_REQUIRED_HOOKS = (
+    "async_pre_call_hook",                       # router /v1/chat/completions wake
+    "async_pre_request_hook",                     # pass-through /v1/messages wake + context_management
+    "async_pre_call_deployment_hook",             # preserve-thinking + max_tokens clamp
+    "async_post_call_streaming_iterator_hook",    # streamed usage injection
+    "log_pre_api_call",                           # preflight /tokenize
+)
+
+
+def _assert_handler_dispatch_wired(handler: "Handler") -> None:
+    missing = [n for n in _REQUIRED_HOOKS if not callable(getattr(handler, n, None))]
+    if missing:
+        log.error(
+            "Handler dispatch self-check FAILED -- missing hooks %s -- wake/injection "
+            "will silently no-op on those paths; likely a stale callbacks bind-mount "
+            "(force-recreate litellm to re-bind)", missing)
+    else:
+        log.info("Handler dispatch self-check OK: %d hooks wired", len(_REQUIRED_HOOKS))
