@@ -547,6 +547,22 @@ async def test_pre_request_hook_off_returns_none_and_does_not_mutate(monkeypatch
     assert "drop_params" not in kwargs          # no per-request un-gate when off
 
 
+async def test_pre_request_hook_on_but_no_messages_returns_none(monkeypatch):
+    # L3 path guard: PROXY_COMPACT is on but messages is empty -> not a compactable
+    # generation request (the polyfill can't summarize nothing). Return None, inject
+    # neither context_management nor the per-request drop_params=False. Defensive against
+    # the hook ever firing on a non-generation request.
+    monkeypatch.setattr(L.backend, "ensure_up", _noop_ensure_up)
+    monkeypatch.setattr(L, "PROXY_COMPACT", True)
+    monkeypatch.setattr(L, "PROXY_COMPACT_THRESHOLD", 90000)
+    h = L.Handler()
+    kwargs = {"model": "qwen3.6-35b-a3b", "messages": []}
+    out = await h.async_pre_request_hook(kwargs["model"], kwargs["messages"], kwargs)
+    assert out is None
+    assert "context_management" not in kwargs
+    assert "drop_params" not in kwargs
+
+
 async def test_pre_request_hook_on_injects_context_management(monkeypatch):
     monkeypatch.setattr(L.backend, "ensure_up", _noop_ensure_up)
     monkeypatch.setattr(L, "PROXY_COMPACT", True)
@@ -570,8 +586,9 @@ async def test_pre_request_hook_threshold_env_drives_value(monkeypatch):
     monkeypatch.setattr(L, "PROXY_COMPACT", True)
     monkeypatch.setattr(L, "PROXY_COMPACT_THRESHOLD", 123456)
     h = L.Handler()
-    kwargs = {"model": "qwen3.6-27b", "messages": []}
-    out = await h.async_pre_request_hook("qwen3.6-27b", [], kwargs)
+    msgs = [{"role": "user", "content": "hi"}]      # non-empty (L3 guard skips empty messages)
+    kwargs = {"model": "qwen3.6-27b", "messages": msgs}
+    out = await h.async_pre_request_hook("qwen3.6-27b", msgs, kwargs)
     assert out["context_management"]["edits"][0]["trigger"]["value"] == 123456
 
 
@@ -602,7 +619,8 @@ async def test_pre_request_hook_appends_to_existing_compact_edit(monkeypatch):
     h = L.Handler()
     client_compact = {"type": "compact_20260112",
                       "trigger": {"type": "input_tokens", "value": 50000}}
-    kwargs = {"model": "qwen3.6-35b-a3b", "messages": [],
+    msgs = [{"role": "user", "content": "hi"}]      # non-empty (L3 guard skips empty messages)
+    kwargs = {"model": "qwen3.6-35b-a3b", "messages": msgs,
               "context_management": {"edits": [client_compact]}}
     out = await h.async_pre_request_hook(kwargs["model"], kwargs["messages"], kwargs)
     edits = out["context_management"]["edits"]
@@ -618,7 +636,8 @@ async def test_pre_request_hook_overwrites_malformed_context_management(monkeypa
     monkeypatch.setattr(L, "PROXY_COMPACT", True)
     monkeypatch.setattr(L, "PROXY_COMPACT_THRESHOLD", 90000)
     h = L.Handler()
-    kwargs = {"model": "qwen3.6-35b-a3b", "messages": [], "context_management": "garbage"}
+    msgs = [{"role": "user", "content": "hi"}]      # non-empty (L3 guard skips empty messages)
+    kwargs = {"model": "qwen3.6-35b-a3b", "messages": msgs, "context_management": "garbage"}
     out = await h.async_pre_request_hook(kwargs["model"], kwargs["messages"], kwargs)
     assert out["context_management"] == {"edits": [{
         "type": "compact_20260112",
