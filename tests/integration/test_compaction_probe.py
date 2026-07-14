@@ -89,3 +89,30 @@ def test_proxy_compact_fires_repeatedly_and_transparently():
         f"expected >= 2 repeated polyfill compactions, saw {len(resets)} at turns {resets}; "
         f"turns={[(t['turn'], t['in']) for t in turns]}"
     )
+
+    # --- M2 cross-checks: validate the result via three INDEPENDENT signals, so a
+    # silent injection/wiring failure can't pass on claude's reported numbers alone. ---
+
+    # (1) session_id constancy: the probe resumes ONE session; a mid-probe change means
+    # the --resume chain broke, silently invalidating the per-turn growth model.
+    sids = {t["session_id"] for t in turns if t.get("session_id")}
+    assert len(sids) == 1, f"session_id changed mid-probe (resume chain broke): {sids}"
+
+    # (2) cross-check delta: vLLM's cumulative prompt_tokens is monotonic, so every turn's
+    # delta must be >= 0. A negative delta means a broken /metrics read or a vLLM restart
+    # mid-probe -- either invalidates the probe's numbers. (delta=0 is fine: a transient
+    # missed read, carried forward by metric()'s None handling.)
+    neg = [t["turn"] for t in turns
+           if isinstance(t["delta"], (int, float)) and t["delta"] < 0]
+    assert not neg, (
+        f"negative vLLM prompt_tokens delta at turns {neg} (broken /metrics read or vLLM restart)")
+
+    # (3) litellm log evidence: the litellm container must log "proxy-compact: injected
+    # context_management" -- proof the opt-in hook fired on the /v1/messages path, not just
+    # that claude's reported numbers happened to drop. Skipped if docker isn't reachable
+    # from the probe host (an environment limitation, not a probe failure).
+    n_logs = P.litellm_injection_log_count()
+    if n_logs is not None:
+        assert n_logs >= 1, (
+            "no 'proxy-compact: injected' lines in litellm logs -- the opt-in hook never "
+            "fired (CLAUDE_QWEN_PROXY_COMPACT not 1 on the litellm service?)")
