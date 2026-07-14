@@ -525,12 +525,21 @@ class Handler(CustomLogger):
         await backend.ensure_up()
         if not PROXY_COMPACT:
             return None
-        kwargs["context_management"] = {
-            "edits": [{
-                "type": "compact_20260112",
-                "trigger": {"type": "input_tokens", "value": PROXY_COMPACT_THRESHOLD},
-            }]
+        # Append the compact edit to an existing context_management.edits list (preserve a
+        # client-supplied spec -- another compact trigger, a clear_tool_uses edit, etc.) --
+        # do NOT clobber it. Malformed/absent -> create a fresh {"edits": [compact]}. The
+        # polyfill processes edits in order, so a client compact + ours is harmless (the
+        # second sees the already-compacted input and no-ops) and a non-compact edit +
+        # ours composes.
+        edit = {
+            "type": "compact_20260112",
+            "trigger": {"type": "input_tokens", "value": PROXY_COMPACT_THRESHOLD},
         }
+        cm = kwargs.get("context_management")
+        if isinstance(cm, dict) and isinstance(cm.get("edits"), list):
+            cm["edits"].append(edit)
+        else:
+            kwargs["context_management"] = {"edits": [edit]}
         # Un-gate the polyfill for THIS request only. The compact_20260112 polyfill
         # short-circuits to no-op when drop_params is truthy (adapters/handler.py:
         # effective_drop_params = drop_params if drop_params is not None else
