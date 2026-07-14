@@ -50,6 +50,12 @@ def _skip_unless_explicitly_enabled():
     # conftest._require_live_stack already skips integration tests when :4000 is down;
     # this gate additionally skips the ~10-15 min probe unless explicitly opted into, so
     # `make test-integration` does NOT run it by default.
+    #
+    # CI hard-exclude: even if RUN_LIVE_COMPACTION_PROBE=1 is set AND :4000 is up (a
+    # self-hosted runner could satisfy both), never launch the 10-15 min live probe in a
+    # CI context. GitHub Actions / most CI systems set the CI env var; skip on it.
+    if os.environ.get("CI"):
+        pytest.skip("live compaction probe is CI-excluded (10-15 min, needs a live stack)")
     if not os.environ.get("RUN_LIVE_COMPACTION_PROBE"):
         pytest.skip("set RUN_LIVE_COMPACTION_PROBE=1 to run the live compaction probe (~10-15 min)")
 
