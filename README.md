@@ -1153,8 +1153,8 @@ litellm container (`make start35` / `make start`, or `docker compose -f
 docker-compose.moe.yaml up -d --force-recreate litellm` to keep vLLM warm).
 
 **Overhead.** Two proxy features add per-request latency:
-- **Preflight `/tokenize`** (`CLAUDE_QWEN_INJECT_STREAMED_USAGE=1`, default on): every streamed `/v1/messages` call does a synchronous `POST /tokenize` to vLLM *before* generation to get the exact `input_tokens` injected into `message_start.usage`. One extra vLLM round-trip per streamed message; runs in a LiteLLM threadpool worker (does not block the event loop) and is prefix-cached, so fast but non-zero.
-- **Polyfill recount + summarization** (`CLAUDE_QWEN_PROXY_COMPACT=1`, off by default): the polyfill recounts input tokens on each `/v1/messages` call, and on each threshold crossing runs a separate full-history summarization generation on vLLM *before* the main call. One extra full vLLM generation per compaction — the dominant cost.
+- **Preflight `/tokenize`** (`CLAUDE_QWEN_INJECT_STREAMED_USAGE=1`, on by default): every streamed `/v1/messages` call issues a `POST /tokenize` to vLLM before generation, producing the exact `input_tokens` for `message_start.usage`. One extra vLLM round-trip per streamed message — on the request's critical path, but offloaded to a LiteLLM threadpool worker (event loop stays free) and prefix-cached, so fast but non-zero.
+- **Polyfill recount + summarization** (`CLAUDE_QWEN_PROXY_COMPACT=1`, off by default): recounts input tokens on every `/v1/messages` call, and at each threshold crossing runs a full-history summarization pass on vLLM before the main call. One extra full vLLM generation per compaction — the dominant cost.
 
 ### Proxy-side compaction (repeated, past the per-session breaker)
 
