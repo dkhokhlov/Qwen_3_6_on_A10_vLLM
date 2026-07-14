@@ -1,5 +1,7 @@
 """Unit tests for the pure (no-I/O) helpers and the preserve-thinking deployment hook
 in litellm_callbacks.py. No mocks needed: these are functions over plain dicts."""
+import json
+
 import pytest
 
 import litellm_callbacks as L
@@ -241,6 +243,52 @@ def test_preflight_sync_returns_none_on_error(monkeypatch):
     assert L._preflight_input_tokens_sync(model="qwen3.6-35b-a3b", messages=[]) is None
 
 
+def test_preflight_sends_exact_payload_with_all_fields(monkeypatch):
+    # The preflight MUST tokenize the EXACT post-conversion body vLLM receives
+    # (messages + tools + chat_template_kwargs from complete_input_dict) -- that is what
+    # makes /tokenize's count equal vLLM's upcoming prompt_tokens (the 538==538 contract).
+    # Dropping tools or chat_template_kwargs undercounts -> injected input_tokens drifts
+    # below vLLM's real prompt_tokens -> claude's tracker grows too slowly -> compaction
+    # fires late/never. Capture the built Request and assert the payload carries every
+    # field, POSTs to /tokenize.
+    sent = {}
+    def fake_urlopen(req, timeout=10.0):
+        sent["url"] = req.full_url
+        sent["data"] = json.loads(req.data.decode())
+        sent["method"] = req.get_method()
+        return _FakeResp(b'{"count": 9001}')
+    monkeypatch.setattr(L.urllib.request, "urlopen", fake_urlopen)
+    tools = [{"type": "function", "function": {"name": "f"}}]
+    ctk = {"preserve_thinking": False}
+    count = L._preflight_input_tokens_sync(
+        model="qwen3.6-35b-a3b",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=tools, chat_template_kwargs=ctk)
+    assert count == 9001
+    assert sent["url"].endswith("/tokenize")
+    assert sent["method"] == "POST"
+    assert sent["data"]["model"] == "qwen3.6-35b-a3b"
+    assert sent["data"]["messages"] == [{"role": "user", "content": "hi"}]
+    assert sent["data"]["tools"] == tools
+    assert sent["data"]["chat_template_kwargs"] == ctk
+
+
+def test_preflight_omits_optional_fields_when_absent(monkeypatch):
+    # tools / chat_template_kwargs are conditional; when absent they must NOT be sent
+    # (vLLM /tokenize would mis-apply defaults). Payload is exactly {model, messages}.
+    sent = {}
+    def fake_urlopen(req, timeout=10.0):
+        sent["data"] = json.loads(req.data.decode())
+        return _FakeResp(b'{"count": 1}')
+    monkeypatch.setattr(L.urllib.request, "urlopen", fake_urlopen)
+    L._preflight_input_tokens_sync(
+        model="qwen3.6-35b-a3b", messages=[{"role": "user", "content": "x"}])
+    assert sent["data"] == {"model": "qwen3.6-35b-a3b",
+                            "messages": [{"role": "user", "content": "x"}]}
+    assert "tools" not in sent["data"]
+    assert "chat_template_kwargs" not in sent["data"]
+
+
 def test_inject_usage_rewrites_bytes_message_start():
     chunk = (b'event: message_start\ndata: '
              b'{"type":"message_start","message":{"usage":{"input_tokens":0}}}\n\n')
@@ -349,6 +397,33 @@ def test_log_pre_api_call_skips_when_preflight_returns_none(monkeypatch):
                 "messages": [{"role": "user", "content": "hi"}]}}}
     h.log_pre_api_call("qwen3.6-35b-a3b", [], kwargs)
     assert "x" not in L._USAGE_INJECT
+
+
+def test_log_pre_api_call_passes_tools_and_template_kwargs_to_preflight(monkeypatch):
+    # The hook extracts messages + tools + chat_template_kwargs from
+    # additional_args.complete_input_dict (the EXACT post-conversion body vLLM receives)
+    # and passes them to _preflight_input_tokens_sync. A regression that stops passing
+    # tools= (the field LiteLLM injects DURING transform_request, AFTER the earlier
+    # deployment hook) would silently undercount. Capture the preflight kwargs and assert
+    # tools + chat_template_kwargs flow through.
+    captured = {}
+    monkeypatch.setattr(L, "_preflight_input_tokens_sync",
+                        lambda **kw: (captured.update(kw) or 538))
+    h = L.Handler()
+    kwargs = {"call_type": "anthropic_messages", "stream": True, "litellm_call_id": "c",
+              "additional_args": {"complete_input_dict": {
+                  "model": "qwen3.6-35b-a3b",
+                  "messages": [{"role": "user", "content": "hi"}],
+                  "tools": [{"type": "function", "function": {"name": "f"}}],
+                  "chat_template_kwargs": {"preserve_thinking": False}}}}
+    try:
+        h.log_pre_api_call("qwen3.6-35b-a3b", [], kwargs)
+        assert captured["model"] == "qwen3.6-35b-a3b"
+        assert captured["messages"] == [{"role": "user", "content": "hi"}]
+        assert captured["tools"] == [{"type": "function", "function": {"name": "f"}}]
+        assert captured["chat_template_kwargs"] == {"preserve_thinking": False}
+    finally:
+        L._USAGE_INJECT.pop("c", None)
 
 
 def test_usage_inject_stash_capped_evicts_oldest(monkeypatch):
