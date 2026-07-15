@@ -670,25 +670,25 @@ the proxy. LiteLLM still reaches vLLM over the compose network at
 container names). `litellm` is the hub — the only service on both networks:
 
 ```
-                      LAN
-                       |   :4000 litellm  ·  :3000 open-webui  ·  :8000 vllm (metrics/bench)
-                       v
-                  +----------+
-                  | litellm  | :4000  -- the hub (only service on BOTH networks):
-                  | (hub)    |        translate + wake/idle lifecycle + websearch_interception
-                  +----+-----+
-       infer /v1/chat  |        | web_search tool -> SearXNG
-        +-------------+        +--------------+
-        v                                     v
-   +----------+                         +------------+   HTTPS   +------------+
-   |  vllm    |                         |  searxng   |  ------>  | DuckDuckGo |
-   | :8000 GPU|                         |   :8080    |           | (internet) |
-   +----------+                         +------------+           +------------+
+                          LAN   (clients: claude / opencode / remote hosts)
+                           │  :4000 litellm  ·  :3000 open-webui  ·  :8000 vllm (metrics/bench)
+                           ▼
+                     ┌───────────┐
+                     │  litellm  │ :4000  ── the hub (only service on BOTH networks):
+                     │  (hub)    │        translate + wake/idle lifecycle + websearch_interception
+                     └─────┬─────┘
+           infer /v1/chat  │ web_search tool
+               ┌───────────┴─────────────┐
+               ▼                         ▼
+          ┌──────────┐             ┌────────────┐       ┌────────────┐
+          │  vllm    │             │  searxng   │ HTTPS │ DuckDuckGo │
+          │ :8000 GPU│             │   :8080    │ ─────→│ (internet) │
+          └──────────┘             └────────────┘       └────────────┘
 
-   open-webui :3000  (browser chat UI)  -->  litellm:4000/v1
+   open-webui :3000  (browser chat UI)  ──→  litellm:4000/v1
 
    docker-api network (INTERNAL, no egress):
-       litellm  --Engine API-->  docker-sock-proxy :2375  -->  /var/run/docker.sock
+       litellm  ──Engine API──→  docker-sock-proxy :2375  ──→  /var/run/docker.sock
                                 (HAProxy whitelist: POST /containers/{id}/{start,stop} + GET /_ping only)
 
    default network (bridge, HAS egress): litellm + vllm + open-webui + searxng.
