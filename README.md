@@ -1104,7 +1104,7 @@ the same value at both hooks (the nested inner `acompletion` reuses the outer ca
  │  async_pre_call_deployment_hook ── OpenAI kwargs                      │ ← pre-conversion (undercounts tools)
  │          │                                                            │
  │          ▼  transform_request  →  wire body (data)                    │
- │  ★ log_pre_api_call ── complete_input_dict = data                     │ ← POST-conversion  (EXACT)
+ │  * log_pre_api_call ── complete_input_dict = data                     │ ← POST-conversion  (EXACT)
  │          │      PREFLIGHT: POST vLLM /tokenize                        │   stash count by litellm_call_id
  │          ▼  HTTP POST /v1/chat/completions  (stream)                  │
  └─────────────────────────┬─────────────────────────────────────────────┘
@@ -1114,7 +1114,7 @@ the same value at both hooks (the nested inner `acompletion` reuses the outer ca
                            ▼
  ┌───────────────────────────────────────────────────────────────────────┐
  │ LiteLLM  serialize → Anthropic SSE                                    │
- │  ★ async_post_call_streaming_iterator_hook                            │ ← INJECT: rewrite the first
+ │  * async_post_call_streaming_iterator_hook                            │ ← INJECT: rewrite the first
  │          │      message_start.usage.input_tokens = stashed count      │   message_start SSE frame
  │          ▼   event: message_start\ndata: {… "usage": {…}}             │
  └─────────────────────────┬─────────────────────────────────────────────┘
