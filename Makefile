@@ -7,7 +7,7 @@ BENCH   ?= scripts/coding_session_bench.py
 TURNS   ?= 27  # reaches ~64k seq (full context): ~2k input + ~500 output/turn
 VLLM_IMAGE := $(shell grep -m1 'image: vllm/vllm-openai' docker-compose.yaml | sed 's/.*image: //; s/ .*//')
 
-.PHONY: help run start stop run35 start35 stop35 clean ci test test-integration test-all bench bench35 bench_pcie test-pcie idle-test litellm-logs litellm-logs35
+.PHONY: help run start stop run35 start35 stop35 run_tp2 start_tp2 stop_tp2 run35_tp2 start35_tp2 stop35_tp2 clean ci test test-integration test-all bench bench35 bench_tp2 bench35_tp2 bench_pcie test-pcie idle-test litellm-logs litellm-logs35 litellm-logs_tp2 litellm-logs35_tp2
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -30,11 +30,31 @@ start35: ## Start the 35B MoE stack detached (background)
 stop35: ## Stop the 35B MoE stack (containers kept, not removed)
 	docker compose -f docker-compose.moe.yaml stop
 
+run_tp2: ## Start the 27B dense TP=2 stack in the foreground, sharded across BOTH A10s (Ctrl-C to stop)
+	docker compose -f docker-compose.tp2.yaml up
+
+start_tp2: ## Start the 27B dense TP=2 stack detached, sharded across BOTH A10s (128k ctx)
+	docker compose -f docker-compose.tp2.yaml up -d
+
+stop_tp2: ## Stop the 27B dense TP=2 stack (containers kept, not removed)
+	docker compose -f docker-compose.tp2.yaml stop
+
+run35_tp2: ## Start the 35B MoE TP=2 stack in the foreground, sharded across BOTH A10s (Ctrl-C to stop)
+	docker compose -f docker-compose.moe.tp2.yaml up
+
+start35_tp2: ## Start the 35B MoE TP=2 stack detached, sharded across BOTH A10s (256k ctx, NO offload)
+	docker compose -f docker-compose.moe.tp2.yaml up -d
+
+stop35_tp2: ## Stop the 35B MoE TP=2 stack (containers kept, not removed)
+	docker compose -f docker-compose.moe.tp2.yaml stop
+
 clean: ## FULL RESET (destructive): wipe Open WebUI DB + vLLM caches across BOTH stacks
 	@echo "==> Destroying volumes (IRREVERSIBLE): open-webui-data, vllm_cache, vllm_cache_moe"
 	@echo "    open-webui-data holds your admin account + chat history -> gone."
 	-docker compose -f docker-compose.yaml down -v
 	-docker compose -f docker-compose.moe.yaml down -v
+	-docker compose -f docker-compose.tp2.yaml down -v
+	-docker compose -f docker-compose.moe.tp2.yaml down -v
 	@echo "==> Done. Recreate with: make start  (27B)  or  make start35  (35B MoE)"
 	@echo "    First visit to :3000 re-creates the Open WebUI admin account; the model list"
 	@echo "    re-seeds from OPENAI_API_BASE_URL (litellm:4000/v1)."
@@ -56,6 +76,12 @@ bench: ## Run the growing coding-session bench (override with TURNS=N)
 	$(PY) $(BENCH) --turns $(TURNS)
 
 bench35: ## Bench the 35B MoE stack via vLLM (qwen3.6-35b-a3b; override with TURNS=N)
+	$(PY) $(BENCH) --model qwen3.6-35b-a3b --turns $(TURNS)
+
+bench_tp2: ## Bench the 27B dense TP=2 stack via vLLM (qwen3.6-27b; override with TURNS=N)
+	$(PY) $(BENCH) --model qwen3.6-27b --turns $(TURNS)
+
+bench35_tp2: ## Bench the 35B MoE TP=2 stack via vLLM (qwen3.6-35b-a3b; override with TURNS=N)
 	$(PY) $(BENCH) --model qwen3.6-35b-a3b --turns $(TURNS)
 
 bench_pcie: ## Measure GPU<->host PCIe bandwidth in the vLLM image (free GPU: `make stop` first)
@@ -81,3 +107,9 @@ litellm-logs: ## Tail the LiteLLM proxy (27B stack: translate + wake/idle lifecy
 
 litellm-logs35: ## Tail the LiteLLM proxy (35B MoE stack)
 	docker compose -f docker-compose.moe.yaml logs -f litellm
+
+litellm-logs_tp2: ## Tail the LiteLLM proxy (27B dense TP=2 stack; shows NCCL transport in vllm logs too)
+	docker compose -f docker-compose.tp2.yaml logs -f litellm
+
+litellm-logs35_tp2: ## Tail the LiteLLM proxy (35B MoE TP=2 stack; shows NCCL transport in vllm logs too)
+	docker compose -f docker-compose.moe.tp2.yaml logs -f litellm

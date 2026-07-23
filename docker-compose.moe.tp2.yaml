@@ -1,0 +1,186 @@
+services:
+  vllm:
+    image: vllm/vllm-openai:nightly@sha256:9fe761ad1e8258a5e8f1c28243b1567c19b0a78e3a909c72611fdd1771f0f966   # matches the other 3 stacks — one vLLM version across all stacks (nightly: 35B-A3B Marlin MoE repack)
+    container_name: vllm-qwen-moe-tp2
+    gpus: all   # both A10s; --tensor-parallel-size 2 below shards across them
+    ports:
+      - "0.0.0.0:8000:8000"   # metrics + harness endpoint (overhead testing); chat still via the proxy (:4000)
+    ipc: host   # NCCL SHM transport for the 2 in-container TP workers (added vs TP=1; matches the dense TP=2 stack)
+    shm_size: 32g
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      NCCL_DEBUG: INFO
+    volumes:
+      - /home/owner/.cache/huggingface:/root/.cache/huggingface:ro
+      - vllm_cache_moe_tp2:/root/.cache/vllm   # TP-specific Marlin artifacts; do NOT share with the TP=1 cache
+    # NOTE: --enforce-eager intentionally OFF (same as the dense TP=2 stack): at batch=1 TP=2 is
+    # launch-bound under eager (per-layer MoE all-reduces serialize). CUDA graphs fuse the step +
+    # all-reduces, unlocking the projected ~80-150 tps. Proven on dense (~20 -> ~36 tps). See README Part 4.
+    # MTP speculative decoding is ON (Qwen3_5MoeMTP drafter, num_speculative_tokens=2). The 1-layer
+    # MoE drafter SHARES the target embedding + lm_head, so its unique footprint is ~0.4 GiB/GPU and
+    # total VRAM does not rise. Measured decode lift over no-MTP: +22% short ctx (87.6 -> 106.9 tps),
+    # +28% at 182k ctx (74.8 -> 96.0 tps) -- the gain grows with context (KV-read amortization).
+    # num_spec=2 beats 1 only at long ctx; short ctx is capped by the 256-expert FP16 drafter + the
+    # per-draft SHM all-reduce. Cost: KV 1.81M -> 1.43M tokens (still ~5.5x the 256k window).
+    # --max-num-batched-tokens is 2048 (was 1280) for the draft slots. min_p/logit_bias are silently
+    # ignored under spec (the proxy uses neither). 27B dense does NOT enable MTP (TP=1 OOMs; untested
+    # at TP=2). See README MTP note + Part 4.
+    command: >
+      --model QuantTrio/Qwen3.6-35B-A3B-AWQ
+      --served-model-name qwen3.6-35b-a3b
+      --language-model-only
+      --host 0.0.0.0 --port 8000
+      --tensor-parallel-size 2
+      --gpu-memory-utilization 0.92
+      --max-model-len 256000
+      --kv-cache-dtype fp8
+      --mamba-cache-dtype float16
+      --mamba-ssm-cache-dtype float16
+      --max-num-seqs 1
+      --max-num-batched-tokens 2048
+      --enable-prefix-caching
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_xml
+      --reasoning-parser qwen3
+      --trust-remote-code
+      --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+    # No --cpu-offload-gb (unlike TP=1): 2 GPUs hold the ~21.5 GiB weights with room to
+    # spare, removing the UVA offload tax entirely. If init fails on MoE-Marlin TP, retry
+    # with --enable-expert-parallel (256 experts -> 128/GPU instead of halving each).
+    # --gpu-memory-utilization 0.92 (not 0.95): the MoE sits at the VRAM edge (weights +
+    # fp8 KV + CUDA graphs ~= 21 GiB of 22.5). At 0.95 a cold restart OOMs by <10 MiB (the
+    # CUDA-graph memory-profile estimate swings a few MiB between loads); 0.92 buys ~1 GiB
+    # headroom. With MTP on, KV is ~1.43M tokens (~5.5x the 256k window); without MTP, ~1.81M.
+    # Decode is weight-read-bound, so throughput is unchanged vs 0.95.
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:8000/health\").status==200 else 1)'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 300s   # TP=2 + MoE-Marlin repack is heavier than the TP=1 240s budget
+    restart: unless-stopped   # crash (e.g. OOM) auto-restarts; an engine-API stop (idle-stop)
+                              # still sticks; wake-on-request (ensure_up) backstops per request
+
+  # docker-sock-proxy: holds the root-equivalent Docker socket so LiteLLM doesn't.
+  # HAProxy whitelist -> POST /containers/<name>/{start,stop} + GET /_ping ONLY;
+  # create/delete/exec/images/secrets/volumes/networks all return 403. Internal
+  # network only (no host port); litellm is its sole peer. See litellm_callbacks.py.
+  docker-sock-proxy:
+    image: tecnativa/docker-socket-proxy@sha256:1f3a6f303320723d199d2316a3e82b2e2685d86c275d5e3deeaf182573b47476   # Docker Hub (GHCR denied w/o auth); HAProxy 3.2.4, built 2025-12-16
+    container_name: docker-sock-proxy-qwen-moe-tp2
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # rw: HAProxy connect()s the UDS; the proxy IS the trust boundary
+    environment:
+      POST: "1"
+      ALLOW_START: "1"
+      ALLOW_STOP: "1"
+      CONTAINERS: "0"        # no list/inspect/create/delete
+      EVENTS: "0"            # revoke upstream default (info leak)
+      VERSION: "0"           # revoke upstream default
+      PING: "1"              # keep: backs the healthcheck
+      LOG_LEVEL: info
+    networks:
+      - docker-api           # internal-only; NOT on the default network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:2375/_ping || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # SearXNG: self-hosted meta-search (DuckDuckGo engine) backing LiteLLM's
+  # websearch_interception. Keyless. On the DEFAULT network (needs internet egress to
+  # reach DuckDuckGo -- NOT the internal docker-api net); litellm reaches it as
+  # http://searxng:8080. settings.yml enables the JSON output format LiteLLM queries
+  # (?format=json, off by default) and disables the bot limiter for programmatic access.
+  searxng:
+    image: searxng/searxng@sha256:aaf56bb5ad737d48a8a375778d42eb4ab1757231e6b1eb7980e71d8dd5bdf0de   # :latest as of 2026-07-12 (keyless DDG meta-search backing websearch_interception)
+    container_name: searxng-qwen-moe-tp2
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://localhost:8080/' >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # LiteLLM sole proxy: Anthropic<->OpenAI translation + three model names
+  # (bare/-preserve/-nothink), and owns the vllm lifecycle (wake-on-request,
+  # idle-stop). See litellm_config.moe.yaml + litellm_callbacks.py.
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: vllm-litellm-moe-tp2
+    ports:
+      - "0.0.0.0:4000:4000"   # LAN-accessible: remote hosts drive the proxy (see README Security)
+    environment:
+      LITELLM_VLLM_MODEL: hosted_vllm/qwen3.6-35b-a3b
+      LITELLM_VLLM_API_BASE: http://vllm:8000/v1
+      BACKEND_CONTAINER: vllm-qwen-moe-tp2
+      BACKEND_URL: http://vllm:8000
+      DOCKER_API_BASE: http://docker-sock-proxy:2375   # Engine API via the whitelisted sidecar (no raw socket mount)
+      IDLE_SECONDS: "${VLLM_IDLE_SECONDS:-900}"
+      POLL_SECONDS: "${VLLM_POLL_SECONDS:-10}"
+      WAKE_TIMEOUT_SECONDS: "${VLLM_WAKE_TIMEOUT:-300}"
+      LITELLM_WORKER_STARTUP_HOOKS: litellm_callbacks:start_background_tasks
+      PYTHONPATH: /app
+      CLAUDE_QWEN_MAX_TOKENS_CAP: "16384"   # server-side clamp (kept at TP=1 value; 256k window allows up to 51200). TODO: bump to use TP=2 headroom if desired
+      CLAUDE_QWEN_INJECT_STREAMED_USAGE: "1"   # preflight /tokenize -> message_start.input_tokens (auto-compact)
+      CLAUDE_QWEN_PROXY_COMPACT: "0"           # opt-in proxy-side compaction (compact_20260112 polyfill); 0=off (default, claude's own auto-compact), 1=inject context_management on /v1/messages for REPEATED server-side compaction past the per-session breaker
+      CLAUDE_QWEN_PROXY_COMPACT_THRESHOLD: "90000"  # input-token trigger (kept at TP=1 value; 256k window has ample headroom). TODO: bump to use TP=2 headroom if desired
+      SEARXNG_API_BASE: http://searxng:8080   # SearXNG instance for websearch_interception (searxng provider)
+    volumes:
+      - ./litellm_config.moe.yaml:/app/litellm_config.yaml:ro
+      - ./litellm_callbacks.py:/app/litellm_callbacks.py:ro
+    command: --config /app/litellm_config.yaml --port 4000
+    networks:
+      - default      # reach vllm:8000 + open-webui; publish :4000
+      - docker-api   # reach docker-sock-proxy only
+    depends_on:
+      - docker-sock-proxy
+      - searxng
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:4000/health/liveliness\").status==200 else 1)'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped   # proxy stays up so it can answer + wake vllm; vllm's engine-API
+                              # stop (idle) is honored like a crash is NOT, so power-down works
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    ports:
+      - "3000:8080"
+    environment:
+      OPENAI_API_BASE_URL: http://litellm:4000/v1
+      OPENAI_API_KEY: anything
+    volumes:
+      - open-webui-data:/app/backend/data
+    depends_on:
+      - litellm
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:8080/health\").status==200 else 1)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+
+volumes:
+  open-webui-data:
+  vllm_cache_moe_tp2:
+
+networks:
+  docker-api:
+    internal: true   # no host port, no egress; the proxy + litellm are its only members

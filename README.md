@@ -58,7 +58,7 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 
 **Part 4 — Scaling Beyond One A10**
 - [PCIe bandwidth](#pcie-bandwidth--grounding-the-tp2-on-x4-question)
-- [Two A10 cards — TP=2 projections](#two-a10-cards--tp2-projections-for-dense-and-moe)
+- [Two A10 cards — TP=2](#two-a10-cards--tp2-for-dense-and-moe)
 
 ## Part 1 — Getting Started
 
@@ -215,7 +215,7 @@ it persists into serving, not load-only — but the penalty is ~15 tps, not 2 tp
 | 35B MoE KV + state cache | ~1.78 GiB → 150 349 tokens |
 
 A second A10 on the same host would lift both ceilings and remove the MoE
-offload tax — see [Two A10 cards — TP=2 projections](#two-a10-cards--tp2-projections-for-dense-and-moe).
+offload tax — see [Two A10 cards — TP=2](#two-a10-cards--tp2-for-dense-and-moe).
 
 ### AWQ quantization — the method, and why both models use it
 
@@ -588,7 +588,7 @@ The 2.2 GiB UVA offload is not free at serving time:
   step by PCIe stalls reading the offloaded weight fraction + `--enforce-eager`
   kernel-launch bubbles + batch=1 (no overlap). 80 % is the efficiency
   ceiling of the offload path: decode would be higher on a GPU-only deployment
-  (see [Two A10 cards](#two-a10-cards--tp2-projections-for-dense-and-moe)).
+  (see [Two A10 cards](#two-a10-cards--tp2-for-dense-and-moe)).
 - **vLLM-log "2.4 t/s" and "0 % hit" are misleading at idle** — the Avg
   generation throughput is a rolling average diluted by idle gaps, and a single
   idle sample shows 0 % hit. The per-turn bench numbers are authoritative, not the idle log.
@@ -937,31 +937,43 @@ bug — the per-turn bench column is authoritative, or wait for the rolling wind
 
 ### Experiments that did NOT work (do not retry without reason)
 
-#### MTP speculative decoding — does not fit on this GPU (27B)
+#### MTP speculative decoding — OOMs on one A10 (27B), enabled on 2× A10 (MoE)
 
-The checkpoint has an MTP head (`mtp_num_hidden_layers = 1`). vLLM v0.24.0 ships
-`vllm/model_executor/models/qwen3_5_mtp.py` and registers `Qwen3_5MTP`; enable
-with `--speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":1}'`.
+The checkpoint has an MTP head (`mtp_num_hidden_layers = 1`, `mtp_use_dedicated_embeddings =
+False` — the drafter SHARES the target's embedding + lm_head). vLLM ships
+`vllm/model_executor/models/qwen3_5_mtp.py` and registers `Qwen3_5MTP` (dense) and
+`Qwen3_5MoeMTP` (the 256-expert MoE drafter). Enable with
+`--speculative-config '{"method":"mtp","num_speculative_tokens":N}'` (the older
+`method:"qwen3_5_mtp"` is deprecated but equivalent).
 
-It OOMs at **drafter weight-load**, before any speculation runs, at every util
-tried (0.97, 0.94, 0.91) and `--max-num-batched-tokens` 1024 and 256:
+**27B on a single A10 (TP=1) — OOMs at drafter load, before any speculation.** At
+drafter load the GPU holds weights (18.83 GiB) + fixed overhead (~6 GiB = FP16
+embedding+lm_head 4.7 [vocab 248320 × hidden 5120, untied] + CUDA ctx 0.6 + cuDNN
+workspaces 0.5 + scratch 0.35) ≈ 24.8 GiB > 22.5 GiB. The shortfall is **param-bound** —
+independent of `num_speculative_tokens`, util, and `--max-num-batched-tokens`
+(1024→256 freed only ~40 MiB; the overhead is fixed). Do not retry MTP on the 27B
+single-A10 path. (The earlier "embedding 1.56 GiB" figure undercounted the untied head —
+Qwen3.6's real vocab is 248320, not 151936, so the FP16 embedding+lm_head is 4.7 GiB and
+is the dominant fixed cost.)
 
-```
-Loading weights took 5.2s        # main model 18.83 GiB
-Loading drafter model...          # OOM: tried to allocate 340.00 MiB, 224 MiB free
-```
+**35B MoE on 2× A10 (TP=2) — works and is enabled.** TP halves the weights, so the drafter
+fits with room to spare. The 1-layer MoE drafter shares the target embedding + lm_head, so
+its unique footprint is only ~0.4 GiB/GPU and total VRAM does not rise.
+`docker-compose.moe.tp2.yaml` runs MTP (`num_speculative_tokens = 2`). Measured decode lift
+(warm, sane output verified at both short and long context):
 
-Root cause: at drafter load the GPU holds weights (18.83 GiB) + fixed overhead
-(~3 GiB = FP16 embedding ~1.56 + CUDA ctx ~0.6 + cuDNN workspaces ~0.5 + activation/scratch ~0.35) ≈ 21.84
-GiB, leaving only ~184–224 MiB. The MTP head needs ~340 MiB. The shortfall is
-**independent of `num_speculative_tokens`** (1 vs 2 changes only runtime draft
-activations, not the head footprint) and **independent of util** (drafter loads
-before KV sizing). `--max-num-batched-tokens` 1024→256 freed only ~40 MiB — the
-overhead is fixed, not batch-token-driven.
+| context | no MTP | MTP | boost |
+|---|---|---|---|
+| short (49 tok) | 87.6 tps | 106.9 tps | +22 % |
+| long (182k tok) | 74.8 tps | 96.0 tps | +28 % |
 
-**Conclusion:** MTP is infeasible on this 24GB A10 with this 18.83 GiB model; a
-≥40 GB GPU would fit it. Expected gain if it fit: ~1.3–1.7× output TPS
-(single-token speculation, 1-layer head, ~50–70 % acceptance) → ~28–35 tps, not 2×.
+The gain **grows with context**: each decode step reads the full KV in the 16 full-attention
+layers, and speculation amortizes that larger per-step cost across the verified draft tokens.
+`num_speculative_tokens = 2` beats 1 only at long context; short-context gain is capped by
+the 256-expert FP16 drafter + the per-draft NCCL all-reduce over SHM (no GPU P2P on these
+OCuLink eGPUs). Cost: KV capacity drops 1.81M → 1.43M tokens (still ~5.5× the 256k window);
+prefill is ~5 % slower (one-time per turn). `min_p`/`logit_bias` are silently ignored under
+spec — the proxy uses neither. The 27B dense TP=2 stack does NOT enable MTP (untested there).
 
 #### CUDA graphs (removing `--enforce-eager`) — costs more context than it gains
 
@@ -1301,15 +1313,21 @@ resolve is whether NCCL selects P2P or SHM on the 2-GPU board; identifiable only
 > reports Gen1. The bench warms the link first so the reported gen matches the
 > achieved bandwidth (Gen4).
 
-### Two A10 cards — TP=2 projections for Dense and MoE
+### Two A10 cards — TP=2 for Dense and MoE
 
 Two A10s on a single host (no NVLink — x4 only): lifts context ceilings and removes
 the MoE offload tax. The PCIe grounding above shows **TP=2 pays off for decode**
 (all-reduce <0.5 % of the step); prefill pays ~10–20 %.
 
-> Validation status: the second A10 hardware is on the way in. The TP=2 setup is
-> planned to be validated on real hardware in the next few weeks; until then,
-> all 2×A10 rows below are projections, not measured results.
+> **Validation status: VALIDATED on real 2×A10 hardware (2026-07-23, vLLM nightly
+> `9fe761a`, CUDA graphs on).** Both models TP-shard cleanly — the GatedDeltaNet
+> linear-attn layers AND the MoE-Marlin experts (balanced per-GPU VRAM, 0% gap on
+> both). Decode lifts **1.65× (dense) and ~5.6× (MoE)** over TP=1. All 2×A10 rows
+> below are measured, not projected. Two operational findings: (1) TP=2 at batch=1
+> **requires CUDA graphs** (`--enforce-eager` OFF) — under eager, the 64 per-layer
+> all-reduces serialize and decode stays at ~TP=1; (2) NCCL transport is **SHM, not
+> P2P** (no GPU peer access on these OCuLink eGPUs), which is why measured decode
+> lands below the P2P-based projection.
 
 ```
                        single host — A10s have NO NVLink
@@ -1351,8 +1369,10 @@ Both inflate the **download**, not the **VRAM footprint** — they are cut at lo
 `--language-model-only` skips *loading* visual weights but vLLM still *constructs*
 the visual module, so a checkpoint that **quantized** the visual branch asserts at
 construction (the mattbucci-CT trap — see [MoE checkpoint status](#moe-checkpoint-status)).
-MTP, if opted in, OOMs on a 24GB card (drafter head ~340 MiB, <220 MiB free) —
-needs a ≥40 GB GPU.
+MTP, if opted in, OOMs on a **single** A10 (27B TP=1: param-bound — the 4.7 GiB FP16
+emb+lm_head at vocab 248320 leaves <220 MiB, no room for the drafter). It does **not**
+OOM on the 2×A10 MoE TP=2 stack — TP halves the weights and the drafter shares
+emb+lm_head, so it is **enabled** there for a +22–28% decode lift (see the MTP note).
 
 #### Why TP=2, not PP=2, for single-user serving on x4
 
@@ -1366,43 +1386,52 @@ needs a ≥40 GB GPU.
   not make it **faster**. PP's smaller comm footprint only wins at **high
   batch / multi-user throughput**, a different goal.
 
-#### Projected decode tps
+#### Measured decode tps
 
-Dense decode is GDDR6-bound: `tps ≈ BW / weights_read_per_token × ~0.7`. The formula
-is decode-only; MoE uses a separate active-read envelope because the single-GPU
-MoE measurement is contaminated by UVA offload stalls. 1×A10 rows are measured;
-2×A10 rows are untested projections (no second GPU available for measurement).
+Dense decode is GDDR6-bound: `tps ≈ BW / weights_read_per_token × ~0.7`. Measured
+2026-07-23 on 2×A10 (vLLM nightly, CUDA graphs on, SHM transport). Decode tps is
+shown as low-context → 226k-context. The 1×A10 MoE row is the 2.2 GiB UVA offload
+path (contaminated by PCIe stalls + the 100% CPU offloader); the 2×A10 MoE row
+removes that tax entirely.
 
-| model | setup | offload | decode tps | prefill tps | context | fits 2×A10? |
+| model | setup | offload | decode tps (low→226k ctx) | prefill tps | context | fits 2×A10? |
 |---|---|---|---|---|---|---|
 | 27B Dense | 1× A10 | none | ~21 | ~1026 | 64k | n/a |
 | 35B MoE | 1× A10 | 2.2 GiB | ~15.4 | ~966→698 | 128k | n/a |
-| 27B Dense | 2× A10 TP=2 | none | ~35 | not modeled | 128k (proj; VRAM ceiling ~640k tok) | yes |
-| 35B MoE | 2× A10 TP=2 | none | ~80-150 | not modeled | 256k (proj) | yes (proj) |
+| 27B Dense | 2× A10 TP=2 | none | **~36 → ~28** | ~980 → ~636 | 256k | **yes (measured; 697k tok KV)** |
+| 35B MoE | 2× A10 TP=2 | none | **~86 → ~72** | ~1600–2400 | 256k | **yes (measured; 1.81M tok KV, 1.43M w/ MTP)** |
 
-The 2×A10 projections' reasoning:
+The 2×A10 measured results — and where they land vs the original projection:
 
-- **Dense 27B TP=2 fits 128k with large margin.** Weights shard to ~9.4 GiB/GPU;
-  KV+state is ~35 KiB/token, halved to ~17 KiB/GPU under TP=2, so 128k costs
-  ~2.2 GiB/GPU. With a conservative runtime reserve, that leaves ~8–9 GiB/GPU
-  free; the VRAM ceiling is roughly ~640k tokens, so 128k is limited by
-  `--max-model-len`, not memory. The single-A10 dense path needs
-  `--cpu-offload-gb 6` for 128k and collapses to ~2.5 tps; TP=2 avoids that
-  offload path.
-- **Dense 27B decode at 128k is ~35 tps projected.** At 128k, the 16 fp8
-  full-attention layers add ~2.0 GiB/GPU of KV read per decoded token on top of
-  the ~9.4 GiB/GPU weight shard. Applying the measured dense efficiency gives
-  ~34–36 tps, so use ~35 tps as the 128k planning number.
+- **Dense 27B TP=2 fits 256k with large margin.** Weights shard to ~9.4 GiB/GPU;
+  KV+state is ~35 KiB/token, halved to ~17 KiB/GPU under TP=2, so 256k costs
+  ~4.4 GiB/GPU. Measured VRAM ceiling is ~697k tokens (2.7× the 256k window), so
+  256k is limited by `--max-model-len`, not memory. The single-A10 dense path
+  needs `--cpu-offload-gb 6` for 128k and collapses to ~2.5 tps; TP=2 avoids that
+  offload path and lifts the window to the model's native 256k.
+- **Dense 27B decode: ~36 tps measured at low context, ~28 tps at 226k.** The
+  original ~35 @ 128k projection holds at low/moderate context; at 226k the 16
+  fp8 full-attention layers' KV reads (~2.0 GiB/GPU at 128k, more at 226k) pull
+  decode to ~28. The flat-to-64k property (Part 3) breaks past ~64k as those KV
+  reads grow.
 
 - **No offload needed** — ~21.5 GiB / 2 ≈ 11 GiB/GPU weights, ample room for
   KV+state. Removing offload removes the PCIe-stall tax (the 80 %-power ceiling)
   and the 100 %-CPU offloader thread.
-- **Decode planning estimate is context-sensitive: ~120–180 tps at short/moderate
-  context, degrading toward ~80–150 tps at 256k.** Do not anchor the no-offload
-  TP=2 case to the measured 15.4 tps single-A10 row: that row is the 2.2 GiB UVA
-  offload path, so it includes PCIe weight-read stalls and the 100 %-CPU offloader
-  thread. A no-offload TP=2 deployment moves the active weights back into GDDR6
-  and shards the language weights across both cards.
+- **MoE decode: ~86 tps measured at low context, ~72 tps at 226k — below the
+  ~120-180/~80-150 projection.** The "do not anchor to 15.4 tps" point held (86 ≫
+  15.4, a 5.6× lift once the offload tax is gone), but the absolute number is
+  lower than projected. Cause: the projection assumed P2P transport; these eGPUs
+  have **none** (SHM fallback), and batch=1 MoE expert-routing overhead is higher
+  than the pure-bandwidth ceiling implied. Still a 5.6× win over the offloaded
+  single-GPU path.
+- **MTP (now enabled in the MoE compose) lifts MoE decode another +22–28%.**
+  `docker-compose.moe.tp2.yaml` runs
+  `--speculative-config '{"method":"mtp","num_speculative_tokens":2}'`: short context
+  87.6 → 106.9 tps (+22 %), at 182k context 74.8 → 96.0 tps (+28 %). The gain grows
+  with context (KV-read amortization); the drafter shares the target embedding+lm_head
+  so VRAM does not rise, but KV capacity drops 1.81M → 1.43M tokens. See the MTP note
+  under *Experiments that did NOT work*.
 - **GDDR6 bandwidth does not rule out ~150 tps, but the raw ceiling falls with
   context.** A10 GDDR6 is ~600 GB/s (~559 GiB/s). The MoE active weight read is
   roughly ~1.4–1.5 GiB/token total, or ~0.7–0.75 GiB/token per GPU under TP=2,
@@ -1410,23 +1439,22 @@ The 2×A10 projections' reasoning:
   kernel/runtime overhead. At long context the 10 full-attention layers add KV
   reads: roughly ~0.6 GiB/GPU at 128k and ~1.3 GiB/GPU at 256k, lowering the
   GDDR6 ceiling to about ~400 tps at 128k and ~275 tps at 256k before fixed
-  GatedDeltaNet state reads and runtime overhead. A ~150 tps target is therefore
-  light at short context (~20 % of the weights-only ceiling) but material at
-  256k (~55 % of the KV-inclusive ceiling).
+  GatedDeltaNet state reads and runtime overhead. Measured ~86 tps at short context
+  is only ~12 % of the weights-only ceiling — so SHM transport + batch=1 MoE
+  overhead (not GDDR6 bandwidth) is the limiter; the ~150 tps projection assumed P2P.
 - **PCIe x4 all-reduce is a tax, but not a 20-tps limiter for decode.** The MoE
   hidden size is 2048 with 40 layers, so a two-collective/layer decode path is
-  ~320 KiB/token. That is ~50 µs over P2P and ~100 µs through SHM fallback at
-  the measured ~6.6 GB/s x4 bandwidth. At ~150 tps (6.7 ms/token),
-  bandwidth-only comm is <1–2 %. Collective launch latency may be larger than
-  the transfer time, especially with `--enforce-eager`, which is why the
-  projection is far below the raw GDDR6 ceiling; it still should not collapse to
-  the offloaded 15.4 tps regime if TP is actually active.
-- **Context to 256k (conservative — VRAM is not the limiter)** — ~10 GiB/GPU
-  for KV+state is far more than 256k needs: scaling the measured 1× ratio
-  (1.78 GiB → 150 349 tokens) by the halved per-GPU KV gives ~1.7 M tokens of
-  capacity per GPU. 256k is therefore bounded by the model's `--max-model-len` /
-  max-context config, not by VRAM; the 1072-token mamba align block still
-  requires `--max-num-batched-tokens ≥ 1072`.
+  ~320 KiB/token — ~100 µs through the SHM fallback at the measured ~6.6 GB/s x4
+  bandwidth. Bandwidth-only comm is <1–2 %. The real launch-latency risk is
+  **per-collective launch overhead × 40 layers × 2 collectives** at batch=1: under
+  `--enforce-eager` this serializes and decode stays at ~TP=1 (~20 tps measured).
+  **CUDA graphs fuse the whole step + all-reduces into one replay** — both stacks
+  ship with `--enforce-eager` OFF, which alone took dense from ~20 to ~36 tps.
+- **Context to 256k confirmed — VRAM is not the limiter.** Measured KV headroom:
+  dense 697k tokens (2.7× the 256k window) and MoE 1.81M tokens (7.1×). Both
+  models are natively 256k (`max_position_embeddings 262144`, no rope scaling);
+  256k is bounded by `--max-model-len`, not VRAM. The 1072-token mamba align
+  block still requires `--max-num-batched-tokens ≥ 1072`.
 
 #### Config diff (single-GPU → 2-GPU TP=2)
 
@@ -1434,30 +1462,51 @@ The 2×A10 projections' reasoning:
 |---|---|---|---|---|
 | `--tensor-parallel-size` | 1 | 2 | 1 | 2 |
 | `gpus` | all (1) | all (2) | all (1) | all (2) |
-| `--gpu-memory-utilization` | 0.97 | 0.97 | 0.95 | 0.95–0.97 (more headroom) |
+| `--gpu-memory-utilization` | 0.97 | 0.95 | 0.95 | 0.92 |
 | `--cpu-offload-gb` | — | — | **2.2** | **drop (no offload needed)** |
-| `--max-model-len` | 64000 | **128000 (proj)** | 128000 | **256000 (proj)** |
-| `--max-num-batched-tokens` | 1024 | 1024 | 1280 | 1280 (≥1072 align) |
+| `--max-model-len` | 64000 | **256000** | 128000 | **256000** |
+| `--max-num-batched-tokens` | 1024 | 1024 | 1280 | 2048 (≥1072; MTP draft slots) |
 | `--max-num-seqs` | 1 | 1 | 1 | 1 |
+| `--speculative-config` | — | — | — | `{"method":"mtp","num_speculative_tokens":2}` |
 | weights / GPU | 18.83 GiB | ~9.4 GiB | ~19.2 GiB (+2.2 off) | ~10.75 GiB |
 | `shm_size` | 32g | 32g | 32g | 32g |
 | `NCCL_DEBUG` env | — | `INFO` | `INFO` | `INFO` |
 
+`--gpu-memory-utilization` is set below the single-GPU values (0.95 dense, 0.92 MoE)
+on purpose: at the VRAM edge the CUDA-graph memory-profile estimate swings a few MiB
+between loads, and at 0.97/0.95 a cold restart OOMs by <10 MiB. The lower util trades
+a little KV headroom (still 2.7× dense / 5.6× MoE with MTP, 7.1× without) for ~1 GiB of scratch room;
+decode is weight-bound, so throughput is unchanged.
+
 #### How to verify when running it for real
 
-- `nvidia-smi` per-GPU memory **balanced** (~equal) → TP shards both layer types.
-- `NCCL_DEBUG=INFO` log: `via P2P/IPC` (best) or `via SHM` (fallback, fine);
-  `via NET` would indicate TCP (shouldn't happen intra-node).
-- 27B dense decode ~35 tps at 128k; 35B MoE decode ~120+ tps at short/moderate context, or
-  materially above 15.4 tps at 256k → no-offload TP is working. MoE stuck near
-  15.4 tps means the run is still effectively on the offloaded/single-GPU path,
-  TP is not sharding the hybrid layers, or init fell back/failed.
+- `nvidia-smi` per-GPU memory **balanced** (measured: 0% gap on both models) → TP
+  shards both the GatedDeltaNet linear-attn layers AND the MoE experts.
+- `NCCL_DEBUG=INFO` log: measured `via SHM/direct/direct` on these OCuLink eGPUs
+  (no GPU P2P); `via NET` would indicate TCP (shouldn't happen intra-node).
+- 27B dense decode ~36 tps (low-ctx) → ~28 at 226k; 35B MoE ~86 tps (low-ctx) →
+  ~72 at 226k — both well above their TP=1 baselines (21 / 15.4). MoE stuck near
+  15.4 tps means the run is still on the offloaded/single-GPU path, TP is not
+  sharding the hybrid layers, or init fell back/failed. Also confirm
+  `--enforce-eager` is OFF (eager → launch-bound → no speedup). With MTP enabled
+  (MoE compose only) decode reads ~107 tps low-ctx / ~96 at 182k — the ~86/~72
+  above is the no-MTP baseline; see the MTP note.
 
-#### Open risks (not resolvable on a 1-GPU box)
+#### Findings & residual notes
 
-- **vLLM's TP sharding of the GatedDeltaNet linear-attn layers is unverified**
-  — the main risk for both models. If TP only shards the full-attn layers, load
-  is imbalanced and the 2× never materializes. The balanced-memory check above
-  catches this.
-- x4 prefill tax ~10–20 % (P2P vs SHM).
+- **GatedDeltaNet + MoE-expert TP sharding: VERIFIED** (was the main risk).
+  Balanced per-GPU VRAM (0% gap on both) confirms TP shards the linear-attn layers
+  AND the experts — not just the full-attn layers. The 2× materialized.
+- **CUDA graphs are required** (`--enforce-eager` OFF). Under eager, TP=2 at
+  batch=1 is launch-bound (per-layer all-reduces serialize) and decode stays at
+  ~TP=1. Both composes ship eager OFF; the KV headroom absorbs graph-capture memory.
+- **Transport is SHM, not P2P** (no GPU peer access on OCuLink eGPUs). Decode-costed
+  <1–2 %, but it is why measured decode (~86/~72 MoE, ~36/~28 dense) lands below
+  the P2P-based projection (~120-180/~80-150 MoE).
+- **Cold-restart VRAM edge**: at `--gpu-memory-utilization` ≥ 0.95 the MoE OOMs by
+  <10 MiB on restart (graph-profile estimate swing); 0.92 (MoE) / 0.95 (dense) fix
+  it. The `restart: unless-stopped` policy can leak orphaned workers on a crash —
+  `docker compose down` clears them.
+- x4 prefill tax: small at low context, but dense prefill drops 980 → 636 tps at
+  226k (the 16 full-attn layers' KV writes); budget for long-context prefill.
 - PP=2 at batch=1 → ~same latency as 1 GPU + comm; don't use PP for single-user.

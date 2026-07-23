@@ -12,6 +12,11 @@ REPO = Path(__file__).resolve().parents[2]
 STACKS = [
     pytest.param(REPO / "docker-compose.yaml", REPO / "litellm_config.yaml", "qwen3.6-27b", id="dense"),
     pytest.param(REPO / "docker-compose.moe.yaml", REPO / "litellm_config.moe.yaml", "qwen3.6-35b-a3b", id="moe"),
+    # TP=2 stacks shard one model across BOTH A10s. They reuse the existing litellm configs
+    # (served-model-name unchanged), so every model-name-keyed invariant holds for them too;
+    # only the vLLM --tensor-parallel-size / --max-model-len / container name differ.
+    pytest.param(REPO / "docker-compose.tp2.yaml", REPO / "litellm_config.yaml", "qwen3.6-27b", id="dense_tp2"),
+    pytest.param(REPO / "docker-compose.moe.tp2.yaml", REPO / "litellm_config.moe.yaml", "qwen3.6-35b-a3b", id="moe_tp2"),
 ]
 
 
@@ -331,27 +336,31 @@ def test_searxng_service_wired_to_litellm(compose_p, litellm_p, base):
 # Cross-stack invariants (must be identical across both compose files)
 # --------------------------------------------------------------------------- #
 def _composes():
-    return _load(REPO / "docker-compose.yaml"), _load(REPO / "docker-compose.moe.yaml")
+    # All four stacks: the two TP=1 stacks and the two TP=2 stacks.
+    return [
+        _load(REPO / "docker-compose.yaml"),
+        _load(REPO / "docker-compose.moe.yaml"),
+        _load(REPO / "docker-compose.tp2.yaml"),
+        _load(REPO / "docker-compose.moe.tp2.yaml"),
+    ]
 
 
 def test_vllm_image_pinned_identically_across_stacks():
-    a, b = _composes()
-    img_a = a["services"]["vllm"]["image"]
-    img_b = b["services"]["vllm"]["image"]
-    assert img_a == img_b
-    assert "@sha256:" in img_a, "vLLM image must be pinned by digest"
+    imgs = [c["services"]["vllm"]["image"] for c in _composes()]
+    assert len(set(imgs)) == 1, f"vLLM images differ across stacks: {imgs}"
+    assert "@sha256:" in imgs[0], "vLLM image must be pinned by digest"
 
 
 def test_docker_sock_proxy_identical_across_stacks():
-    a, b = _composes()
-    sa, sb = a["services"]["docker-sock-proxy"], b["services"]["docker-sock-proxy"]
-    assert sa["image"] == sb["image"]
-    assert sa["environment"] == sb["environment"]
+    socks = [c["services"]["docker-sock-proxy"] for c in _composes()]
+    first_img, first_env = socks[0]["image"], socks[0]["environment"]
+    for s in socks:
+        assert s["image"] == first_img, "docker-sock-proxy image must be identical across stacks"
+        assert s["environment"] == first_env, "docker-sock-proxy environment must be identical across stacks"
 
 
 def test_docker_sock_proxy_allowlist_is_least_privilege():
-    a, _ = _composes()
-    env = a["services"]["docker-sock-proxy"]["environment"]
+    env = _composes()[0]["services"]["docker-sock-proxy"]["environment"]
     assert env["POST"] == "1" and env["ALLOW_START"] == "1" and env["ALLOW_STOP"] == "1"
     assert env["CONTAINERS"] == "0"  # no list/inspect/create/delete
     assert env["EVENTS"] == "0"      # no info leak
@@ -360,7 +369,6 @@ def test_docker_sock_proxy_allowlist_is_least_privilege():
 def test_searxng_image_pinned_by_digest():
     # Match the repo convention (vllm + docker-sock-proxy): pin by digest so a deploy is
     # reproducible and a moved :latest tag can't silently change behavior.
-    a, b = _composes()
-    for name, compose in [("dense", a), ("moe", b)]:
+    for compose in _composes():
         img = compose["services"]["searxng"]["image"]
-        assert "@sha256:" in img, f"{name}: searxng image must be pinned by digest; got {img!r}"
+        assert "@sha256:" in img, f"searxng image must be pinned by digest; got {img!r}"
