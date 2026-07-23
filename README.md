@@ -11,14 +11,37 @@ Serve the latest [**Qwen3.6**](https://huggingface.co/collections/Qwen/qwen36) �
 **dense** model and a **mixture-of-experts (MoE)** model, built for **agentic coding**
 and tool use — on a single [NVIDIA A10](https://www.techpowerup.com/gpu-specs/a10-pcie.c3793)
 (24GB) with [vLLM](https://github.com/vllm-project/vllm). Qwen reports 73–77% on [SWE-bench](https://www.swebench.com) Verified for the two base models.
-Real measured throughput at full context:
+Real measured decode tps — one A10 vs two A10 (tensor-parallel, CUDA graphs on) — at
+2k (small) and at each setup's max context:
 
-- **[Qwen3.6-27B-AWQ](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ) — a
-  dense model** (27B active params, no experts) at full **64k context, no CPU
-  offload**, output `21tps` flat to max context.
-- **[Qwen3.6-35B-A3B-AWQ](https://huggingface.co/QuantTrio/Qwen3.6-35B-A3B-AWQ)
-  — a MoE model** (35B total / 3B active, 256 routed experts) at full **128k
-  context with 2.2 GiB UVA CPU offload**, output `15.4tps` flat to max context.
+**Qwen3.6-27B-AWQ** (dense)
+
+| setup | decode (small) | decode (full) | small ctx | max ctx | CPU offload (UVA) |
+|---|---|---|---|---|---|
+| **1× A10** | **21 tps** | **21 tps** | 2k | 64k | none |
+| **2× A10 (TP=2)** | **36 tps** | **28 tps** | 2k | 256k | none |
+
+**Qwen3.6-35B-A3B-AWQ** (MoE)
+
+| setup | decode (small) | decode (full) | small ctx | max ctx | CPU offload (UVA) |
+|---|---|---|---|---|---|
+| **1× A10** | **15.4 tps** | **15.4 tps** | 2k | 128k | 2.2 GiB |
+| **2× A10 (TP=2)** | **86 tps** | **72 tps** | 2k | 256k | none |
+
+- **max ctx** is the allocated context window (max-model-len); **decode (full)** is measured
+  at the largest tested context — 64k / 128k on 1× and **226k** on 2×A10 (within the 256k
+  window, not at it).
+- **[Qwen3.6-27B-AWQ](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ)** — a dense model
+  (27B active params, no experts). At full **64k context, no CPU offload**, it outputs
+  **21 tps** flat to max context.
+- **[Qwen3.6-35B-A3B-AWQ](https://huggingface.co/QuantTrio/Qwen3.6-35B-A3B-AWQ)** — a MoE
+  model (35B total / 3B active, 256 routed experts). At full **128k context with 2.2 GiB
+  UVA (unified virtual addressing) CPU offload**, it outputs **15.4 tps** flat to max context.
+- **2× A10 (TP=2)** lifts both context windows to **256k max ctx** and removes the MoE's
+  2.2 GiB offload tax; decode rises **1.7× (dense)** and **5.6× (MoE)** over 1×. The decode
+  figures are the **no-MTP baseline**; the shipped 2× MoE compose runs MTP (multi-token prediction) on, lifting
+  decode to **107 tps (short) / 96 tps (long)** (+22 % / +28 %) — see
+  [Part 4 — Scaling Beyond One A10](#part-4--scaling-beyond-one-a10).
 
 **The bigger MoE serves *more* context than the smaller dense model** — 128k vs
 64k — because MoE has a smaller KV per token (fewer full-attn layers, smaller
@@ -82,8 +105,8 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 | `make run35` | `docker compose -f docker-compose.moe.yaml up` — 35B MoE, foreground |
 | `make start35` | `docker compose -f docker-compose.moe.yaml up -d` — 35B MoE, detached |
 | `make stop35` | `docker compose -f docker-compose.moe.yaml stop` — 35B MoE |
-| `make bench` | growing coding-session bench to ~64k context on the 27B (override `TURNS=N`) |
-| `make bench35` | same bench on the 35B MoE (override `TURNS=N`; `TURNS=54` → ~128k) |
+| `make bench` | growing coding-session bench to 64k context on the 27B (override `TURNS=N`) |
+| `make bench35` | same bench on the 35B MoE (override `TURNS=N`; `TURNS=54` → 128k) |
 | `make bench_pcie` | GPU↔host PCIe bandwidth (needs a free GPU: `make stop` first) |
 
 `run`/`start`/`stop` target the 27B dense stack (`docker-compose.yaml`);
@@ -144,12 +167,12 @@ host that can reach `:4000` or `:8000` as trusted — this is deliberate; see
 | full-attn layers | 16 | 10 (1-in-4) |
 | attn / KV heads / head_dim | 24 / 4 / 256 | 16 / 2 / 256 |
 | routed experts | none | 256 + 1 shared |
-| weights on GPU (AWQ-Marlin) | 18.83 GiB | ~21.5 GiB (language-only) |
+| weights on GPU (AWQ-Marlin) | 18.83 GiB | 21.5 GiB (language-only) |
 | KV+state per token | large (16 full-attn × 5120) | small (10 full-attn × 2048) |
 | CPU offload | none | **2.2 GiB (UVA)** |
 | `--max-model-len` (1× A10) | **64 000** | **128 000** |
 | KV-cache tokens | 64 744 | 150 349 |
-| decode tps (flat to max ctx) | ~21 → 19.6 (−10%) | 15.3 → 15.4 (flat) |
+| decode tps (flat to max ctx) | 21 → 19.6 (−10%) | 15.3 → 15.4 (flat) |
 | prefill tps (short → long ctx) | 1026 → 526 (−49%) | 966 → 698 (−28%) |
 | prefix-cache block (align) | 800 tokens | 1072 tokens |
 | `--gpu-memory-utilization` | 0.97 | 0.95 |
@@ -167,9 +190,9 @@ context" intuition:
 |---|---|---|---|
 | active params / token | 27B (every MLP runs) | 3B (only routed experts run) | MoE: lighter compute, but **irrelevant to context** (context is KV-bound, not compute-bound) |
 | full-attn layers | 16 | 10 (1-in-4) | MoE has fewer layers attending over the prefix |
-| hidden dim | 5120 | 2048 | MoE KV head is 2.5× smaller per layer |
-| **KV + state per token** | **~35 KiB** (large; ~3× MoE) | **~11 KiB** (but far fewer full-attn tokens) | MoE pays less context cost per token |
-| weights on GPU | 18.83 GiB (fits) | ~21.5 GiB (does **not** fit) | MoE must offload 2.2 GiB |
+| hidden dim | 5120 | 2048 | 2.5× smaller, but per-layer KV is only 2× (kv_heads 4 vs 2) |
+| **KV + state per token** | **35 KiB** (large; 3× MoE) | **11 KiB** (but far fewer full-attn tokens) | MoE pays less context cost per token |
+| weights on GPU | 18.83 GiB (fits) | 21.5 GiB (does **not** fit) | MoE must offload 2.2 GiB |
 
 The dense 27B is **param-light enough to fit cleanly** (18.83 GiB weights +
 ~2.15 GiB KV+state ≈ 21.0 GiB, under the 21.40 GiB 0.97-budget → 64k) but its
@@ -194,8 +217,8 @@ From the 1 GiB offload run: GPU weights 20.31, KV 0.65 → vLLM's non-KV reserve
 
 | path | weights | reserve | total | budget headroom (per-row util) | usable context |
 |---|---|---|---|---|---|
-| GPU-only @ 0.97 | 21.38 | 0.44 | 21.82 | over by 0.42 (vs 21.40; Marlin repack OOM) | ~0 |
-| GPU-only @ 0.99 | 21.38 | 0.44 | 21.82 | under by ~0.02 (vs 21.84; fails init) | ~2k |
+| GPU-only @ 0.97 | 21.38 | 0.44 | 21.82 | over by 0.42 (vs 21.40; Marlin repack OOM) | 0 |
+| GPU-only @ 0.99 | 21.38 | 0.44 | 21.82 | under by 0.02 (vs 21.84; fails init) | 2k |
 | **2.2 GiB offload @ 0.95** | 19.18 | — | 19.18 | 1.78 GiB KV+state (measured, 150 349 tok; 20.96 − 19.18) | **128k** |
 
 So GPU-only is param+reserve-bound by ~0.2 GiB at the achievable util; offload
@@ -206,13 +229,13 @@ it persists into serving, not load-only — but the penalty is ~15 tps, not 2 tp
 
 | | |
 |---|---|
-| GPU | NVIDIA A10, Ampere sm86, 24GB VRAM (~22.06 GiB usable by vLLM) |
+| GPU | NVIDIA A10, Ampere sm86, 24GB VRAM (22.06 GiB usable by vLLM) |
 | PCIe | Gen4 **x4** — eGPU rig: A10 in an external enclosure, host↔GPU routed via an M.2 NVMe → OCuLink (SFF-8612) adapter, which exposes only 4 lanes. Card is x16-capable; the adapter/wiring caps the link at x4. |
 | TP | 1 (single GPU) |
 | 27B weights on GPU | 18.83 GiB |
-| 27B KV + state cache | ~2.15 GiB → 64 744 tokens |
-| 35B MoE weights on GPU | ~19.2 GiB (after 2.2 GiB offload from ~21.4 GiB post-repack) |
-| 35B MoE KV + state cache | ~1.78 GiB → 150 349 tokens |
+| 27B KV + state cache | 2.15 GiB → 64 744 tokens |
+| 35B MoE weights on GPU | 19.2 GiB (after 2.2 GiB offload from 21.4 GiB post-repack) |
+| 35B MoE KV + state cache | 1.78 GiB → 150 349 tokens |
 
 A second A10 on the same host would lift both ceilings and remove the MoE
 offload tax — see [Two A10 cards — TP=2](#two-a10-cards--tp2-for-dense-and-moe).
@@ -257,7 +280,7 @@ The whole tensor stays INT4; only a small per-group scale + zero-point is added
 3. **Quantize** — apply the scales (`W·s`, quantize; activations get `÷s`), pack
    to INT4 with group-128 scales + zero-points (asymmetric).
 4. **Protect** — keep a small allowlist in FP16 (`modules_to_not_convert`). For
-   the 27B this is the ~5 GiB FP16-leftovers gap shown in the
+   the 27B this is the ~6 GiB FP16-leftovers gap shown in the
    [Deployment A footprint table](#deployment-a--qwen36-27b-awq-dense).
 
 Net: AWQ-INT4 typically stays within **<1 perplexity point** and **<1 %** on
@@ -278,7 +301,7 @@ which is exactly why the MoE run **offloads 2.2 GiB before the repack** (see
 [MoE no-offload math](#moe-no-offload-math-why-offload-is-required-not-optional)).
 
 The payoff: weights stay INT4-packed in GDDR6 through all of serving. For the
-27B that is ~18.8 GiB instead of ~54 GiB FP16 (~2.9× smaller), read at INT4
+27B that is ~18.8 GiB instead of 50.3 GiB FP16 (2.7× smaller), read at INT4
 bandwidth (~3–4× faster decode). Without AWQ-Marlin neither model fits; with it,
 both decode flat to max context.
 
@@ -289,7 +312,7 @@ both decode flat to max context.
 | AWQ config | 4-bit, group-128, zero-point | 4-bit, group-128, zero-point |
 | quantized to INT4 | every layer's MLP `gate`/`up`/`down` | the 256 routed experts |
 | kept FP16 (`modules_to_not_convert`) | `self_attn` & `linear_attn` projections, `model.layers.0`, `mtp`, `visual` | whole `self_attn` & `linear_attn`, **+ `shared_expert` + router (`mlp.gate`)**, `model.layers.0`, `mtp`, `visual` |
-| repack | automatic | `awq_marlin_moe_repack` — ~128 MiB scratch → forces the 2.2 GiB offload |
+| repack | automatic | `awq_marlin_moe_repack` — 128 MiB scratch → forces the 2.2 GiB offload |
 
 Same AWQ-INT4 + Marlin recipe; the only model-specific wrinkle is the MoE
 repack's transient scratch, which is what makes offload mandatory for the 35B
@@ -313,18 +336,18 @@ repack) see [AWQ quantization — the method, and why both models use it](#awq-q
 
 | | size | what |
 |---|---|---|
-| Pure INT4 (theoretical) | ~13.5 GiB | 27B × 0.5 bytes/param |
+| Pure INT4 (theoretical) | 12.6 GiB | 27B × 0.5 bytes/param |
 | On-disk checkpoint | 20.35 GiB | INT4 + FP16 leftovers + visual branch + AWQ scale/zp |
-| **Loaded on GPU** | **18.83 GiB** | `--language-model-only` skips ~1.5 GiB visual branch |
+| **Loaded on GPU** | **18.83 GiB** | `--language-model-only` skips 1.5 GiB visual branch |
 
-The ~5 GiB gap between pure-INT4 and loaded = the **FP16 leftovers** kept
+The ~6 GiB gap between pure-INT4 and loaded = the **FP16 leftovers** kept
 unquantized for accuracy (config `modules_to_not_convert`):
 
 | kept FP16 | quantized INT4 (AWQ-Marlin) |
 |---|---|
 | `self_attn.{q,k,v}_proj`, `linear_attn.in_proj_{a,b}`, `model.layers.0`, `mtp` | MLP `gate` / `up` / `down` (the big tensors) |
 
-If vLLM dequantized to FP16 the footprint would be ~54 GiB — wouldn't fit, and
+If vLLM dequantized to FP16 the footprint would be 50.3 GiB — wouldn't fit, and
 decode would be ~3–4× slower. Marlin keeps INT4 packed in GDDR6 and dequants inside
 the GEMM, so you get the full memory/bandwidth benefit.
 
@@ -341,7 +364,7 @@ Qwen3.6-27B-AWQ  —  64 transformer layers (hybrid)
   ┌──────────────────────────────────────────────┐
   │  16 × full-attention layers                  │  KV cache (FP8)
   │     self_attn q/k/v  — FP16                  │  O(context) / token
-  │     MLP gate/up/down — INT4 AWQ-Marlin       │  ← grows with context
+  │     MLP gate/up/down — INT4 AWQ-Marlin       │  ← fixed cost at any ctx
   └──────────────────────────────────────────────┘
   ┌──────────────────────────────────────────────┐
   │  48 × GatedDeltaNet linear-attention layers  │  SSM state cache (FP16)
@@ -405,7 +428,7 @@ Flag rationale (non-obvious ones):
 | flag | value | why |
 |---|---|---|
 | `--language-model-only` | — | serve the text branch of the VLM checkpoint (skip visual) |
-| `--gpu-memory-utilization` | 0.97 | 0.98 + 70k OOM'd on prefill (zero activation headroom); 0.97 leaves ~220 MiB |
+| `--gpu-memory-utilization` | 0.97 | 0.98 + 70k OOM'd on prefill (zero activation headroom); 0.97 leaves 220 MiB |
 | `--max-model-len` | 64000 | stable ceiling; align-mode (prefix caching) reduces KV so 65536 → 64000 |
 | `--kv-cache-dtype` | fp8 | quantize the 16 full-attn layers' KV (FlashInfer on Ampere) |
 | `--mamba-ssm-cache-dtype` | **float16** | **key lever** — FP32→FP16 on 48 linear layers; ceiling 54.9k → 72.5k tokens |
@@ -425,7 +448,9 @@ host env (not committed).
 #### Verified performance (27B)
 
 `make bench` (default `TURNS=27`) grows the session to seq 63924 ≈ the 64k
-ceiling. Condensed (every 8th turn + final):
+ceiling. This is a **no-think** bench (`coding_session_bench.py` sends
+`enable_thinking:false`); decode tps is a per-token rate, so it is the same
+with thinking on. Condensed (every 8th turn + final):
 
 ```
 turn  prompt   out     seq  cached uncached  ttft_s prefill_tps  out_tps  lat_s  hit%
@@ -461,8 +486,8 @@ Qwen3.6-35B-A3B-AWQ  —  40 transformer layers (hybrid)
   ┌──────────────────────────────────────────────┐
   │  10 × full-attention layers (1-in-4)         │  KV cache (FP8)
   │     self_attn q/k/v  — FP16                  │  O(context) / token
-  │     MLP: 256 routed + 1 shared expert        │  ← grows with context
-  │          only ~8 routed + shared active/token│
+  │     MLP: 256 routed + 1 shared expert        │  ← fixed cost at any ctx
+  │          only 8 routed + shared active/token │
   └──────────────────────────────────────────────┘
   ┌──────────────────────────────────────────────┐
   │  30 × GatedDeltaNet linear-attention layers  │  SSM state cache (FP16)
@@ -494,11 +519,11 @@ Measured envelope (QuantTrio, vLLM nightly, `--language-model-only`,
 
 | cpu-offload-gb | util | max-model-len | prefix-cache | batched | GPU KV tokens | decode tps | status |
 |---|---|---|---|---|---|---|---|
-| 1.0 | 0.97 | 60 000  | on | 2048 | 60 967  | ~24 | short-prompt only (NOT prefill-tested) |
+| 1.0 | 0.97 | 60 000  | on | 2048 | 60 967  | 24 | short-prompt only (NOT prefill-tested) |
 | 2.0 | 0.98 | 160 000 | on | 2048 | 181 538 | —   | OOM first prefill (util 0.98 over-sizes KV) |
-| 2.0 | 0.97 | 140 000 | on | 2048 | 158 394 | ~17 | short-prompt only — OOMs on real prefill |
-| 2.2 | 0.97 | 160 000 | on | 2048 | 192 820 | ~14 | short-prompt only — OOMs on real prefill |
-| **2.2** | **0.95** | **128 000** | **on** | **1280** | **150 349** | **~15.5** | **WORKS — real prefill to 128k, prefix-cache 98 % hit** |
+| 2.0 | 0.97 | 140 000 | on | 2048 | 158 394 | 17 | short-prompt only — OOMs on real prefill |
+| 2.2 | 0.97 | 160 000 | on | 2048 | 192 820 | 14 | short-prompt only — OOMs on real prefill |
+| **2.2** | **0.95** | **128 000** | **on** | **1280** | **150 349** | **15.5** | **WORKS — real prefill to 128k, prefix-cache 98 % hit** |
 
 **Why nightly.** Both composes pin the same image, `vllm/vllm-openai:nightly@sha256:9fe761ad…`.
 The MoE requires nightly for `awq_marlin_moe_repack` (the 35B-A3B Marlin repack above); the
@@ -552,7 +577,8 @@ Env/volumes match the 27B compose (HF cache ro, `vllm_cache_moe` volume,
 #### Verified performance (35B MoE)
 
 `make bench35 TURNS=54` grows the session to seq 127 460 ≈ the 128k ceiling.
-Condensed (every 8th turn + final):
+Same no-think bench as the 27B (`enable_thinking:false`). Condensed (every 8th
+turn + final):
 
 ```
 turn  prompt    out    seq   cached uncached  ttft_s prefill_tps  out_tps  lat_s  hit%
@@ -600,12 +626,12 @@ are dead ends — do not retry without reason.
 
 | checkpoint | group | lang-only size | status |
 |---|---|---|---|
-| **QuantTrio/Qwen3.6-35B-A3B-AWQ** | 128 | ~21.5 GiB | **SERVABLE** per the envelope above (Marlin WNA16 MoE, the only viable MoE backend on Ampere) |
+| **QuantTrio/Qwen3.6-35B-A3B-AWQ** | 128 | 21.5 GiB | **SERVABLE** per the envelope above (Marlin WNA16 MoE, the only viable MoE backend on Ampere) |
 | mattbucci/Qwen3.6-35B-A3B-AWQ | 128 | 19.05 GiB | **GARBAGE** — hybrid FP16+AWQ linear-attn layout breaks stacked-shard fusion on both vLLM v0.24.0 (180 skips) and nightly (`MergedColumnParallelLinear has no attribute 'data'`); SGLang's `in_proj_ba` fusion also fails. Fits without offload but unusable regardless. |
-| cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit | 32 | ~22.4 GiB | **OOM at construction** — only routed experts AWQ; linear_attn + self_attn + shared_expert + embeddings + lm_head all FP16; group-32 scales inflate. 22.4 > 22.06, param-bound (independent of context/offload). |
+| cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit | 32 | 22.4 GiB | **OOM at construction** — only routed experts AWQ; linear_attn + self_attn + shared_expert + embeddings + lm_head all FP16; group-32 scales inflate. 22.4 > 22.06, param-bound (independent of context/offload). |
 
 FP8 weights are the wrong lever on A10 (Ampere sm86 has no native FP8 tensor
-cores): FP8 = 1 byte/param = 35 GiB (2× INT4), worse for fit. FP8 is a Hopper
+cores): FP8 = 1 byte/param = 32.6 GiB (2× INT4), worse for fit. FP8 is a Hopper
 feature. (FP8 *KV* via FlashInfer works on Ampere and is used here.)
 
 ---
@@ -644,8 +670,8 @@ is **not** wired into either stack.
 
 | condition | power | memory | p-state |
 |---|---|---|---|
-| served / loaded-idle (both stacks) | ~58 W | ~22 GiB | P0 |
-| idle 15 min → backend stopped | **~15 W** | **0 MiB** | P8 |
+| served / loaded-idle (both stacks) | 58 W | 22 GiB | P0 |
+| idle 15 min → backend stopped | **15 W** | **0 MiB** | P8 |
 
 The `0 MiB` reading proves the CUDA context is torn down, not merely asleep.
 After a stop the card re-downshifts P0→P8 within ~30 s, then settles to ~15 W.
@@ -780,7 +806,7 @@ MCP server, no `--disallowedTools`).
 Real Claude Code requests carry `web_search` *alongside* their other tools (Read,
 Bash, …), so they take LiteLLM's **agentic loop**: Qwen calls the search tool,
 SearXNG runs, results return, Qwen synthesizes. That is why this works despite
-upstream [litellm#29649](https://github.com/BerRIAI/litellm/issues/29649), whose
+upstream [litellm#29649](https://github.com/BerriAI/litellm/issues/29649), whose
 raw-results short-circuit fires only for web-search-*only* requests — a shape
 Claude Code never sends. Verified end-to-end: a time-sensitive question returns a
 synthesized answer citing a source URL.
@@ -949,7 +975,7 @@ False` — the drafter SHARES the target's embedding + lm_head). vLLM ships
 **27B on a single A10 (TP=1) — OOMs at drafter load, before any speculation.** At
 drafter load the GPU holds weights (18.83 GiB) + fixed overhead (~6 GiB = FP16
 embedding+lm_head 4.7 [vocab 248320 × hidden 5120, untied] + CUDA ctx 0.6 + cuDNN
-workspaces 0.5 + scratch 0.35) ≈ 24.8 GiB > 22.5 GiB. The shortfall is **param-bound** —
+workspaces 0.5 + scratch 0.35) ≈ 24.8 GiB > 22.06 GiB. The shortfall is **param-bound** —
 independent of `num_speculative_tokens`, util, and `--max-num-batched-tokens`
 (1024→256 freed only ~40 MiB; the overhead is fixed). Do not retry MTP on the 27B
 single-A10 path. (The earlier "embedding 1.56 GiB" figure undercounted the untied head —
@@ -1025,7 +1051,7 @@ param-bound). Do not retry without reason.
 
 - **120k no-offload is impossible on this A10 for the dense 27B**: 22.06 −
   18.83 = 3.23 GiB raw free (0.97 cap → 2.57); at ~35 KiB/token, 120k needs
-  ~4.0 GiB — over budget. Real ceiling 64 744 tokens (L152; the bare rate on
+  ~4.0 GiB — over budget. Real ceiling 64 744 tokens (the bare rate on
   raw free is ~95k, but the 0.97 cap + non-KV overhead lower it to 64k).
 - **The MoE 35B is param-bound without offload** — weights 21.38 + reserve 0.44
   = 21.82 GiB > the 21.40 GiB achievable at util 0.97. No amount of context fits
@@ -1131,7 +1157,7 @@ the same value at both hooks (the nested inner `acompletion` reuses the outer ca
  │          ▼   event: message_start\ndata: {… "usage": {…}}             │
  └─────────────────────────┬─────────────────────────────────────────────┘
                            ▼
-        Claude Code   tracker grows → crosses window − max_output − 13K (~98K at WINDOW=128000;
+        Claude Code   tracker grows → crosses window − max_output − 13K (98K at WINDOW=128000;
                        PCT override ignored for gateway models) → compact_boundary fires
 ```
 
@@ -1284,14 +1310,14 @@ bandwidth and bounds the TP=2 all-reduce cost on the x4 link. A10 negotiates
 **Gen4 x4**; measured steady-state (large payloads, pinned + non_blocking):
 
 ```
-H2D ~6.65 GB/s    D2H ~6.59 GB/s    (~84% of Gen4 x4 line rate ~7.9 GB/s)
+H2D 6.65 GB/s    D2H 6.59 GB/s    (84% of Gen4 x4 line rate 7.9 GB/s)
 ```
 
 A 1-GPU test bounds a 2-GPU TP=2 conclusion: NCCL's all-reduce uses **P2P** (best
 case) or **SHM fallback** (worst case, if P2P is blocked by ACS/topology). The
 SHM per-hop cost is exactly a cudaMemcpy D2H/H2D — measurable here. P2P does one
 link hop (GPU0→GPU1); SHM does two (D2H + H2D). So SHM is the conservative upper
-bound and P2P is ~half of it.
+bound and P2P is half of it.
 
 TP=2 all-reduce volume (model geometry: hidden=5120, layers=64, fp16). Per-layer
 tensor = 10 KiB at decode batch=1; one-way = 64 × 10 KiB = 640 KiB/token (decode),
@@ -1299,15 +1325,14 @@ tensor = 10 KiB at decode batch=1; one-way = 64 × 10 KiB = 640 KiB/token (decod
 
 | | SHM fallback (worst) | P2P (≈half) |
 |---|---|---|
-| decode (47 ms step) | **0.43 %** (203 µs) | ~0.2 % |
-| prefill 2000 (2.0 s) | **19.8 %** (396 ms) | ~10 % |
+| decode (47 ms step) | **0.43 %** (203 µs) | 0.2 % |
+| prefill 2000 (2.0 s) | **19.8 %** (396 ms) | 10 % |
 
 **Conclusion:** on x4, TP=2 all-reduce is negligible for decode (<0.5 %) — the
 >20-tps goal is unhurt by comm; GDDR6-read parallelism (each GPU reads half the
-weights) is what gives ~2× decode. Prefill pays a real ~10–20 % comm tax on x4
-(1026 → ~850–870 prefill tps). The decisive unknown this 1-GPU test can't
-resolve is whether NCCL selects P2P or SHM on the 2-GPU board; identifiable only from the
-`NCCL_DEBUG=INFO` log.
+weights) is what gives 2× decode. Prefill pays a real 10–20 % comm tax on x4
+(1026 → 850–870 prefill tps, **projected**; measured TP=2 prefill is 980 → 636 — see the table below). The decisive unknown (P2P vs SHM) was resolved on the 2-GPU run: NCCL selects
+**SHM** (no GPU peer access on these OCuLink eGPUs) — see the validation note below.
 
 > Caveat: PCIe ASPM downshifts the link to Gen1 at idle; `nvidia-smi` at rest
 > reports Gen1. The bench warms the link first so the reported gen matches the
@@ -1317,15 +1342,15 @@ resolve is whether NCCL selects P2P or SHM on the 2-GPU board; identifiable only
 
 Two A10s on a single host (no NVLink — x4 only): lifts context ceilings and removes
 the MoE offload tax. The PCIe grounding above shows **TP=2 pays off for decode**
-(all-reduce <0.5 % of the step); prefill pays ~10–20 %.
+(all-reduce <0.5 % of the step); prefill pays 10–20 %.
 
 > **Validation status: VALIDATED on real 2×A10 hardware (2026-07-23, vLLM nightly
 > `9fe761a`, CUDA graphs on).** Both models TP-shard cleanly — the GatedDeltaNet
 > linear-attn layers AND the MoE-Marlin experts (balanced per-GPU VRAM, 0% gap on
-> both). Decode lifts **1.65× (dense) and ~5.6× (MoE)** over TP=1. All 2×A10 rows
+> both). Decode lifts **1.7× (dense) and 5.6× (MoE)** over TP=1. All 2×A10 rows
 > below are measured, not projected. Two operational findings: (1) TP=2 at batch=1
 > **requires CUDA graphs** (`--enforce-eager` OFF) — under eager, the 64 per-layer
-> all-reduces serialize and decode stays at ~TP=1; (2) NCCL transport is **SHM, not
+> all-reduces serialize and decode stays at TP=1; (2) NCCL transport is **SHM, not
 > P2P** (no GPU peer access on these OCuLink eGPUs), which is why measured decode
 > lands below the P2P-based projection.
 
@@ -1336,10 +1361,10 @@ the MoE offload tax. The PCIe grounding above shows **TP=2 pays off for decode**
   │              /dev/shm  (NCCL SHM-fallback path)                      │
   └────────┬─────────────────────────────────────┬───────────────────────┘
            │ PCIe Gen4 x4                        │ PCIe Gen4 x4
-           │ ~6.6 GB/s each way                  │
+           │ 6.6 GB/s each way                   │
   ┌────────▼───────────────────────┐    ┌────────▼───────────────────────┐
   │          A10 #0                │    │           A10 #1               │
-  │  24GB GDDR6 @ ~600 GB/s        │    │  24GB GDDR6 @ ~600 GB/s        │
+  │  24GB GDDR6 @ 600 GB/s         │    │  24GB GDDR6 @ 600 GB/s         │
   │                                │    │                                │
   │  TP=2 shard per layer:         │    │  TP=2 shard per layer:         │
   │   • half the weights           │    │   • half the weights           │
@@ -1348,10 +1373,10 @@ the MoE offload tax. The PCIe grounding above shows **TP=2 pays off for decode**
            │                                     │
            └───────────── all-reduce ────────────┘
                  per layer, over x4:
-                   27B decode   ~640 KiB/token  → <0.5% of 47 ms step
-                   35B decode   ~320 KiB/token  → <1–2% of 6.7 ms step
-                   27B prefill  ~1.22 GiB / 2000 → ~10–20% of step
-                 transport: P2P (1 hop) if ACS allows, else SHM (2 hops)
+                   27B decode   640 KiB/token  → <0.5% of 28 ms step
+                   35B decode   320 KiB/token  → <1–2% of 12 ms step
+                   27B prefill  1.22 GiB / 2000 → 10–20% of step
+                 transport: SHM (2 hops) — no GPU P2P here (measured)
 ```
 
 #### Footprint: MTP + visual are downloaded, not loaded
@@ -1361,8 +1386,8 @@ Both inflate the **download**, not the **VRAM footprint** — they are cut at lo
 
 | component | on disk | in VRAM | cut by |
 |---|---|---|---|
-| visual branch | ~1–1.5 GiB | no | `--language-model-only` prefix-filters visual weights |
-| MTP head | ~0.1–0.34 GiB | no | default `speculative_config=None` → `skip_prefixes=["mtp."]` (opt-in via `--speculative-config`) |
+| visual branch | 1–1.5 GiB | no | `--language-model-only` prefix-filters visual weights |
+| MTP head | 0.1–0.34 GiB | no | default `speculative_config=None` → `skip_prefixes=["mtp."]` (opt-in via `--speculative-config`) |
 | language model | yes | **yes** | — |
 
 **VRAM goes to the language-model weights + KV/state caches only.** Caveat:
@@ -1378,48 +1403,48 @@ emb+lm_head, so it is **enabled** there for a +22–28% decode lift (see the MTP
 
 - **TP=2 parallelizes the GDDR6 weight reads** (the actual decode bottleneck) —
   each GPU reads half the weights per step → faster decode. All-reduce at
-  batch=1 is small on x4: ~640 KiB/token one-way for the 27B dense and
-  ~320 KiB/token for the 35B MoE nominal two-collective/layer path used below.
+  batch=1 is small on x4: 640 KiB/token one-way for the 27B dense and
+  320 KiB/token for the 35B MoE nominal two-collective/layer path used below.
 - **PP=2 at batch=1 does not overlap** (no pipeline to fill) — stages run
-  serially, one GPU idle each half-step → ~same latency as a single GPU that
+  serially, one GPU idle each half-step → same latency as a single GPU that
   could fit the model, *plus* comm. PP makes a too-big model **fit** but does
   not make it **faster**. PP's smaller comm footprint only wins at **high
   batch / multi-user throughput**, a different goal.
 
 #### Measured decode tps
 
-Dense decode is GDDR6-bound: `tps ≈ BW / weights_read_per_token × ~0.7`. Measured
+Dense decode is GDDR6-bound: `tps ≈ BW / weights_read_per_token × 0.7`. Measured
 2026-07-23 on 2×A10 (vLLM nightly, CUDA graphs on, SHM transport). Decode tps is
 shown as low-context → 226k-context. The 1×A10 MoE row is the 2.2 GiB UVA offload
 path (contaminated by PCIe stalls + the 100% CPU offloader); the 2×A10 MoE row
 removes that tax entirely.
 
-| model | setup | offload | decode tps (low→226k ctx) | prefill tps | context | fits 2×A10? |
+| model | setup | offload | decode tps (low→226k ctx) | prefill tps | max ctx | fits 2×A10? |
 |---|---|---|---|---|---|---|
-| 27B Dense | 1× A10 | none | ~21 | ~1026 | 64k | n/a |
-| 35B MoE | 1× A10 | 2.2 GiB | ~15.4 | ~966→698 | 128k | n/a |
-| 27B Dense | 2× A10 TP=2 | none | **~36 → ~28** | ~980 → ~636 | 256k | **yes (measured; 697k tok KV)** |
-| 35B MoE | 2× A10 TP=2 | none | **~86 → ~72** | ~1600–2400 | 256k | **yes (measured; 1.81M tok KV, 1.43M w/ MTP)** |
+| 27B Dense | 1× A10 | none | 21 | 1026 → 526 | 64k | n/a |
+| 35B MoE | 1× A10 | 2.2 GiB | 15.4 | 966→698 | 128k | n/a |
+| 27B Dense | 2× A10 TP=2 | none | **36 → 28** | 980 → 636 | 256k | **yes (measured; 697k tok KV)** |
+| 35B MoE | 2× A10 TP=2 | none | **86 → 72** | 1600–2400 | 256k | **yes (measured; 1.81M tok KV, 1.43M w/ MTP)** |
 
 The 2×A10 measured results — and where they land vs the original projection:
 
-- **Dense 27B TP=2 fits 256k with large margin.** Weights shard to ~9.4 GiB/GPU;
-  KV+state is ~35 KiB/token, halved to ~17 KiB/GPU under TP=2, so 256k costs
-  ~4.4 GiB/GPU. Measured VRAM ceiling is ~697k tokens (2.7× the 256k window), so
+- **Dense 27B TP=2 fits 256k with large margin.** Weights shard to 9.4 GiB/GPU;
+  KV+state is 35 KiB/token, halved to 17 KiB/GPU under TP=2, so 256k costs
+  4.4 GiB/GPU. Measured VRAM ceiling is 697k tokens (2.7× the 256k window), so
   256k is limited by `--max-model-len`, not memory. The single-A10 dense path
-  needs `--cpu-offload-gb 6` for 128k and collapses to ~2.5 tps; TP=2 avoids that
+  needs `--cpu-offload-gb 6` for 128k and collapses to 2.5 tps; TP=2 avoids that
   offload path and lifts the window to the model's native 256k.
-- **Dense 27B decode: ~36 tps measured at low context, ~28 tps at 226k.** The
-  original ~35 @ 128k projection holds at low/moderate context; at 226k the 16
-  fp8 full-attention layers' KV reads (~2.0 GiB/GPU at 128k, more at 226k) pull
-  decode to ~28. The flat-to-64k property (Part 3) breaks past ~64k as those KV
+- **Dense 27B decode: 36 tps measured at low context, 28 tps at 226k.** The
+  original 35 @ 128k projection holds at low/moderate context; at 226k the 16
+  fp8 full-attention layers' KV reads (2.0 GiB/GPU at 128k, more at 226k) pull
+  decode to 28. The flat-to-64k property (Part 3) breaks past 64k as those KV
   reads grow.
 
-- **No offload needed** — ~21.5 GiB / 2 ≈ 11 GiB/GPU weights, ample room for
+- **No offload needed** — 21.5 GiB / 2 ≈ 11 GiB/GPU weights, ample room for
   KV+state. Removing offload removes the PCIe-stall tax (the 80 %-power ceiling)
   and the 100 %-CPU offloader thread.
-- **MoE decode: ~86 tps measured at low context, ~72 tps at 226k — below the
-  ~120-180/~80-150 projection.** The "do not anchor to 15.4 tps" point held (86 ≫
+- **MoE decode: 86 tps measured at low context, 72 tps at 226k — below the
+  120-180/80-150 projection.** The "do not anchor to 15.4 tps" point held (86 ≫
   15.4, a 5.6× lift once the offload tax is gone), but the absolute number is
   lower than projected. Cause: the projection assumed P2P transport; these eGPUs
   have **none** (SHM fallback), and batch=1 MoE expert-routing overhead is higher
@@ -1432,24 +1457,24 @@ The 2×A10 measured results — and where they land vs the original projection:
   with context (KV-read amortization); the drafter shares the target embedding+lm_head
   so VRAM does not rise, but KV capacity drops 1.81M → 1.43M tokens. See the MTP note
   under *Experiments that did NOT work*.
-- **GDDR6 bandwidth does not rule out ~150 tps, but the raw ceiling falls with
-  context.** A10 GDDR6 is ~600 GB/s (~559 GiB/s). The MoE active weight read is
-  roughly ~1.4–1.5 GiB/token total, or ~0.7–0.75 GiB/token per GPU under TP=2,
-  so the weights-only near-zero-context ceiling is ~745–800 tps before
+- **GDDR6 bandwidth does not rule out 150 tps, but the raw ceiling falls with
+  context.** A10 GDDR6 is 600 GB/s (559 GiB/s). The MoE active weight read is
+  roughly 1.4–1.5 GiB/token total, or 0.7–0.75 GiB/token per GPU under TP=2,
+  so the weights-only near-zero-context ceiling is 745–800 tps before
   kernel/runtime overhead. At long context the 10 full-attention layers add KV
-  reads: roughly ~0.6 GiB/GPU at 128k and ~1.3 GiB/GPU at 256k, lowering the
-  GDDR6 ceiling to about ~400 tps at 128k and ~275 tps at 256k before fixed
-  GatedDeltaNet state reads and runtime overhead. Measured ~86 tps at short context
-  is only ~12 % of the weights-only ceiling — so SHM transport + batch=1 MoE
-  overhead (not GDDR6 bandwidth) is the limiter; the ~150 tps projection assumed P2P.
+  reads: roughly 0.6 GiB/GPU at 128k and 1.3 GiB/GPU at 256k, lowering the
+  GDDR6 ceiling to about 400 tps at 128k and 275 tps at 256k before fixed
+  GatedDeltaNet state reads and runtime overhead. Measured 86 tps at short context
+  is only 12 % of the weights-only ceiling — so SHM transport + batch=1 MoE
+  overhead (not GDDR6 bandwidth) is the limiter; the 150 tps projection assumed P2P.
 - **PCIe x4 all-reduce is a tax, but not a 20-tps limiter for decode.** The MoE
   hidden size is 2048 with 40 layers, so a two-collective/layer decode path is
-  ~320 KiB/token — ~100 µs through the SHM fallback at the measured ~6.6 GB/s x4
+  320 KiB/token — 100 µs through the SHM fallback at the measured 6.6 GB/s x4
   bandwidth. Bandwidth-only comm is <1–2 %. The real launch-latency risk is
   **per-collective launch overhead × 40 layers × 2 collectives** at batch=1: under
-  `--enforce-eager` this serializes and decode stays at ~TP=1 (~20 tps measured).
+  `--enforce-eager` this serializes and decode stays at TP=1 (20 tps measured).
   **CUDA graphs fuse the whole step + all-reduces into one replay** — both stacks
-  ship with `--enforce-eager` OFF, which alone took dense from ~20 to ~36 tps.
+  ship with `--enforce-eager` OFF, which alone took dense from 20 to 36 tps.
 - **Context to 256k confirmed — VRAM is not the limiter.** Measured KV headroom:
   dense 697k tokens (2.7× the 256k window) and MoE 1.81M tokens (7.1×). Both
   models are natively 256k (`max_position_embeddings 262144`, no rope scaling);
@@ -1468,14 +1493,14 @@ The 2×A10 measured results — and where they land vs the original projection:
 | `--max-num-batched-tokens` | 1024 | 1024 | 1280 | 2048 (≥1072; MTP draft slots) |
 | `--max-num-seqs` | 1 | 1 | 1 | 1 |
 | `--speculative-config` | — | — | — | `{"method":"mtp","num_speculative_tokens":2}` |
-| weights / GPU | 18.83 GiB | ~9.4 GiB | ~19.2 GiB (+2.2 off) | ~10.75 GiB |
+| weights / GPU | 18.83 GiB | 9.4 GiB | 19.2 GiB (+2.2 off) | 10.75 GiB |
 | `shm_size` | 32g | 32g | 32g | 32g |
 | `NCCL_DEBUG` env | — | `INFO` | `INFO` | `INFO` |
 
 `--gpu-memory-utilization` is set below the single-GPU values (0.95 dense, 0.92 MoE)
 on purpose: at the VRAM edge the CUDA-graph memory-profile estimate swings a few MiB
 between loads, and at 0.97/0.95 a cold restart OOMs by <10 MiB. The lower util trades
-a little KV headroom (still 2.7× dense / 5.6× MoE with MTP, 7.1× without) for ~1 GiB of scratch room;
+a little KV headroom (still 2.7× dense / 5.6× MoE with MTP, 7.1× without) for 1 GiB of scratch room;
 decode is weight-bound, so throughput is unchanged.
 
 #### How to verify when running it for real
@@ -1484,12 +1509,12 @@ decode is weight-bound, so throughput is unchanged.
   shards both the GatedDeltaNet linear-attn layers AND the MoE experts.
 - `NCCL_DEBUG=INFO` log: measured `via SHM/direct/direct` on these OCuLink eGPUs
   (no GPU P2P); `via NET` would indicate TCP (shouldn't happen intra-node).
-- 27B dense decode ~36 tps (low-ctx) → ~28 at 226k; 35B MoE ~86 tps (low-ctx) →
-  ~72 at 226k — both well above their TP=1 baselines (21 / 15.4). MoE stuck near
+- 27B dense decode 36 tps (low-ctx) → 28 at 226k; 35B MoE 86 tps (low-ctx) →
+  72 at 226k — both well above their TP=1 baselines (21 / 15.4). MoE stuck near
   15.4 tps means the run is still on the offloaded/single-GPU path, TP is not
   sharding the hybrid layers, or init fell back/failed. Also confirm
   `--enforce-eager` is OFF (eager → launch-bound → no speedup). With MTP enabled
-  (MoE compose only) decode reads ~107 tps low-ctx / ~96 at 182k — the ~86/~72
+  (MoE compose only) decode reads 107 tps low-ctx / 96 at 182k — the 86/72
   above is the no-MTP baseline; see the MTP note.
 
 #### Findings & residual notes
@@ -1499,14 +1524,14 @@ decode is weight-bound, so throughput is unchanged.
   AND the experts — not just the full-attn layers. The 2× materialized.
 - **CUDA graphs are required** (`--enforce-eager` OFF). Under eager, TP=2 at
   batch=1 is launch-bound (per-layer all-reduces serialize) and decode stays at
-  ~TP=1. Both composes ship eager OFF; the KV headroom absorbs graph-capture memory.
+  TP=1. Both composes ship eager OFF; the KV headroom absorbs graph-capture memory.
 - **Transport is SHM, not P2P** (no GPU peer access on OCuLink eGPUs). Decode-costed
-  <1–2 %, but it is why measured decode (~86/~72 MoE, ~36/~28 dense) lands below
-  the P2P-based projection (~120-180/~80-150 MoE).
+  <1–2 %, but it is why measured decode (86/72 MoE, 36/28 dense) lands below
+  the P2P-based projection (120-180/80-150 MoE).
 - **Cold-restart VRAM edge**: at `--gpu-memory-utilization` ≥ 0.95 the MoE OOMs by
   <10 MiB on restart (graph-profile estimate swing); 0.92 (MoE) / 0.95 (dense) fix
   it. The `restart: unless-stopped` policy can leak orphaned workers on a crash —
   `docker compose down` clears them.
 - x4 prefill tax: small at low context, but dense prefill drops 980 → 636 tps at
   226k (the 16 full-attn layers' KV writes); budget for long-context prefill.
-- PP=2 at batch=1 → ~same latency as 1 GPU + comm; don't use PP for single-user.
+- PP=2 at batch=1 → same latency as 1 GPU + comm; don't use PP for single-user.
