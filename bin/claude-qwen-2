@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 2xA10 TP=2 variant of claude-qwen: lifts the context window to 256k (and the output cap
 # to dense 16k / moe 32k) by exporting QWEN_CTX_MODE=2x and delegating to claude-qwen. Use
-# this against the TP=2 stacks (make start_tp2 / make start35_tp2); use claude-qwen (the
+# this against the TP=2 stacks (make start-tp2 / make start35-tp2); use claude-qwen (the
 # single-A10 default) against the 1x stacks. Same --model / QWEN_FLAVOR knobs as
 # claude-qwen; see that script for full documentation.
 export QWEN_CTX_MODE=2x

@@ -35,7 +35,7 @@ services:
       --language-model-only
       --host 0.0.0.0 --port 8000
       --tensor-parallel-size 2
-      --gpu-memory-utilization 0.92
+      --gpu-memory-utilization 0.88
       --max-model-len 256000
       --kv-cache-dtype fp8
       --mamba-cache-dtype float16
@@ -51,11 +51,13 @@ services:
     # No --cpu-offload-gb (unlike TP=1): 2 GPUs hold the ~21.5 GiB weights with room to
     # spare, removing the UVA offload tax entirely. If init fails on MoE-Marlin TP, retry
     # with --enable-expert-parallel (256 experts -> 128/GPU instead of halving each).
-    # --gpu-memory-utilization 0.92 (not 0.95): the MoE sits at the VRAM edge (weights +
-    # fp8 KV + CUDA graphs ~= 21 GiB of 22.5). At 0.95 a cold restart OOMs by <10 MiB (the
-    # CUDA-graph memory-profile estimate swings a few MiB between loads); 0.92 buys ~1 GiB
-    # headroom. With MTP on, KV is ~1.43M tokens (~5.5x the 256k window); without MTP, ~1.81M.
-    # Decode is weight-read-bound, so throughput is unchanged vs 0.95.
+    # --gpu-memory-utilization 0.88 (was 0.92): the MoE sits at the VRAM edge (weights +
+    # fp8 KV + CUDA graphs ~= 21 GiB of 22.5). 0.92 OOMed at runtime on the FIRST request:
+    # claude-code's ~23k-token system-prompt prefill needs a ~394 MiB activation spike but
+    # only ~276 MiB was free (GPU 98.7% full) -> EngineDeadError -> restart loop.
+    # expandable_segments is already on, so this is capacity exhaustion, not fragmentation.
+    # 0.88 frees ~900 MiB/GPU (shrinks the fp8 KV pool; irrelevant at batch=1). Decode is
+    # weight-read-bound, so throughput is unchanged.
     healthcheck:
       test: ["CMD-SHELL", "python3 -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://localhost:8000/health\").status==200 else 1)'"]
       interval: 15s

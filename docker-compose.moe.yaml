@@ -2,11 +2,15 @@ services:
   vllm:
     image: vllm/vllm-openai:nightly@sha256:9fe761ad1e8258a5e8f1c28243b1567c19b0a78e3a909c72611fdd1771f0f966   # nightly needed for the 35B-A3B Marlin MoE repack (validated 2026-07-07)
     container_name: vllm-qwen35b
-    gpus: all
+    gpus: all   # container sees both A10s; CUDA_VISIBLE_DEVICES below picks which runs the 1x model
     ports:
       - "0.0.0.0:8000:8000"   # metrics + harness endpoint (overhead testing); chat still via the proxy (:4000)
     shm_size: 32g
     environment:
+      # 1x GPU placement: GPU0 is in a Gen3 x4 slot (~4 GB/s), GPU1 in Gen4 x4 (~8 GB/s).
+      # Offloaded decode is PCIe-bound -> GPU1 is ~2x faster. Default 0 (current behavior);
+      # `QWEN_GPU_ID=1 make start35` runs on the Gen4 GPU1.
+      CUDA_VISIBLE_DEVICES: "${QWEN_GPU_ID:-0}"
       HF_TOKEN: ${HF_TOKEN}
       HF_HOME: /root/.cache/huggingface
       HF_HUB_OFFLINE: "1"

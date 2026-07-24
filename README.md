@@ -114,6 +114,15 @@ packed-INT4 through serving, ~3–4× faster to decode than FP16. See
 The two stacks share host port `4000` (the LiteLLM proxy) and the one GPU, so stop
 one before starting the other.
 
+**Which GPU the 1× MoE lands on.** The two A10s are not PCIe-symmetric: GPU0 is
+capped at Gen3 ×4, GPU1 at Gen4 ×4 (both run at ×4 width — the board splits the ×16
+link into ×4/×4). The 1× MoE stack offloads 2.2 GiB of weights to host RAM and reads
+them over PCIe on every decode token, so its decode is PCIe-bound. Measured MoE 1×
+decode: about 9 tok/s on GPU0 (Gen3) vs about 15 tok/s on GPU1 (Gen4), a 1.7× lift.
+Pin the 1× MoE stack to the Gen4 card with `QWEN_GPU_ID=1 make start35`. The default
+(`0`) is unchanged. This applies only to the 1× MoE stack — the dense 1× stack fits a
+single card without offload, and the TP=2 stacks shard across both GPUs.
+
 - LiteLLM proxy (host-facing): `http://localhost:4000` (or the box's LAN IP)
   - Anthropic `/v1/messages` **and** OpenAI `/v1/*` — same base
   - three model names per stack: `<base>` (default), `<base>-preserve`, `<base>-nothink`
