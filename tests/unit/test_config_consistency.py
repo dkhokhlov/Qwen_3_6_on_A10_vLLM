@@ -53,15 +53,23 @@ def test_three_flavors_present(compose_p, litellm_p, base):
 
 
 @pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)
-def test_model_info_max_output_tokens_matches_server_clamp(compose_p, litellm_p, base):
+def test_model_info_max_output_tokens_fits_under_server_clamp(compose_p, litellm_p, base):
     # Claude Code's gateway discovery ignores model_info.max_output_tokens (it reads only
     # id/display_name from /v1/models), so the REAL cap is the server-side clamp env on
-    # the litellm service. model_info is just /v1/models metadata for other clients; it
-    # must at least agree with the clamp so the advertised limit isn't a lie.
+    # the litellm service -- LiteLLM core does NOT enforce model_info on inbound max_tokens
+    # (verified: CC sends max_tokens=32000 and only the callback brings it down). So
+    # model_info is just /v1/models metadata for non-CC clients (open-webui). The litellm
+    # config is SHARED across the 1x and 2x stacks of each model, which since the TP=2
+    # output bump have DIFFERENT clamps (dense 8192 1x / 16384 2x; moe 16384 1x / 32768 2x).
+    # model_info advertises the conservative single-A10 max, so it must stay <= the clamp
+    # (never over-promise a limit the callback will not honor) but need not equal it on 2x.
     compose, litellm = _load(compose_p), _load(litellm_p)
     cap = int(compose["services"]["litellm"]["environment"]["CLAUDE_QWEN_MAX_TOKENS_CAP"])
     for m in litellm["model_list"]:
-        assert m["model_info"]["max_output_tokens"] == cap, m["model_name"]
+        advertised = m["model_info"]["max_output_tokens"]
+        assert advertised <= cap, (
+            f"{m['model_name']}: advertised model_info.max_output_tokens {advertised} "
+            f"must be <= clamp {cap} (never over-promise a limit the callback will not honor)")
 
 
 @pytest.mark.parametrize("compose_p, litellm_p, base", STACKS)

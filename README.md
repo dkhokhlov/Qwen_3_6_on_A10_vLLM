@@ -137,8 +137,10 @@ TPS, and prefix-cache hit %. Cache hit is read from vLLM `/metrics` (at the
 | `docker-compose.moe.yaml` | vLLM (35B MoE, 128k, 2.2 GiB offload) + LiteLLM stack |
 | `litellm_config.yaml` / `.moe.yaml` | LiteLLM config per stack: three model names, one shared backend (env-driven) |
 | `litellm_callbacks.py` | custom callback: wake-on-request + idle-stop |
-| `bin/claude-qwen` | Claude Code wrapper: `--model {moe|dense}` (default moe), sets `ANTHROPIC_*` env, execs `claude` against the proxy |
-| `bin/opencode-qwen` | opencode wrapper: `--model {moe|dense}` (default moe), embeds the litellm provider config via `OPENCODE_CONFIG_CONTENT` and execs `opencode -m litellm/<line>` against the proxy |
+| `bin/claude-qwen` | Claude Code wrapper: `--model {moe|dense}` (default moe), sets `ANTHROPIC_*` env, execs `claude` against the proxy. Context cap defaults to the 1× A10 ceilings (128k MoE / 64k dense); `QWEN_CTX_MODE=2x` (or the `claude-qwen-2` shim) selects the 2× A10 TP=2 stack (256k) |
+| `bin/claude-qwen-2` | thin shim: exports `QWEN_CTX_MODE=2x` and execs `claude-qwen` (use against the 2× A10 TP=2 stacks) |
+| `bin/opencode-qwen` | opencode wrapper: `--model {moe|dense}` (default moe), embeds the litellm provider config via `OPENCODE_CONFIG_CONTENT` and execs `opencode -m litellm/<line>` against the proxy. Same 1×-default / `QWEN_CTX_MODE=2x` context-cap switch as `claude-qwen` |
+| `bin/opencode-qwen-2` | thin shim: exports `QWEN_CTX_MODE=2x` and execs `opencode-qwen` (use against the 2× A10 TP=2 stacks) |
 | `Makefile` | `run` / `start` / `stop` / `run35` / `start35` / `stop35` / `ci` / `test` / `test-integration` / `test-pcie` / `bench` / `bench35` / `bench_pcie` / `idle-test` / `litellm-logs` / `litellm-logs35` |
 | `scripts/coding_session_bench.py` | growing coding-session bench against vLLM (prefill/output tps; prefix-cache hit via `/metrics`). Defaults to vLLM (`:8000`) for real hit%; via the proxy (`:4000`) `hit%` reads 0 |
 | `scripts/pcie_bw_bench.py` | GPU↔host PCIe D2H/H2D bandwidth + TP=2 all-reduce estimate (in-container via `make bench_pcie` / `make test-pcie`) |
@@ -829,18 +831,23 @@ make start   && ./bin/claude-qwen --model dense    # 27B dense stack
 ```
 
 `--model {moe|dense}` (default `moe`) picks the Qwen line and must match the
-running stack — start it first (`make start35` MoE / `make start` dense); the two
-stacks share one A10 + host `:4000`, so only one runs at a time and switching
-lines is a manual cold swap, not automatic. `claude-qwen` points Claude Code at the proxy
+running stack. The context cap must match too: `claude-qwen` defaults to the **1× A10**
+stacks (`make start35` MoE / `make start` dense, 128k/64k ctx); for the **2× A10 TP=2**
+stacks (`make start35_tp2` MoE / `make start_tp2` dense, 256k ctx) use the `claude-qwen-2`
+shim (or `QWEN_CTX_MODE=2x`) — a 256k cap on a 1× stack overflows.
+All stacks share one A10 + host `:4000`, so only one runs at a time — switching is a
+manual cold swap. `claude-qwen` points Claude Code at the proxy
 (`ANTHROPIC_BASE_URL=http://localhost:4000`, no `/v1`), sends a placeholder
 `ANTHROPIC_AUTH_TOKEN` (the proxy is auth-free; Claude Code just needs one
 non-empty), sets the model to `qwen3.6-27b` / `qwen3.6-35b-a3b` and the
 background model to its `-nothink` variant, and enables gateway model discovery
 so `/model` lists all three flavors. It also tells Claude Code the *real* upstream
-window (`CLAUDE_CODE_AUTO_COMPACT_WINDOW` = 128k MoE / 64k dense) and caps output
-(`CLAUDE_CODE_MAX_OUTPUT_TOKENS` = 16384 MoE / 8192 dense): behind a gateway, Claude
-Code otherwise assumes a 200k window and sends `max_tokens=32000`, so auto-compaction
-is scheduled past the 128k/64k wall and the request overflows (a 400 `ContextWindowExceeded`).
+window (`CLAUDE_CODE_AUTO_COMPACT_WINDOW` = 128k MoE / 64k dense by default, or 256k
+under `claude-qwen-2`) and caps output (`CLAUDE_CODE_MAX_OUTPUT_TOKENS` = 8192 dense /
+16384 MoE on 1×, doubled to 16384 dense / 32768 MoE on the 2× stack): behind a gateway,
+Claude Code otherwise assumes a 200k window and sends
+`max_tokens=32000`, so auto-compaction is scheduled past the real wall and the request
+overflows (a 400 `ContextWindowExceeded`).
 The proxy's `CLAUDE_QWEN_MAX_TOKENS_CAP` (above) is the server-side backstop for
 subagents/the small-fast model, which ignore the client env. Sizing the window is
 necessary but not sufficient — the proxy must also report accurate streamed usage for
@@ -858,9 +865,11 @@ make start   && ./bin/opencode-qwen --model dense    # 27B dense stack
 ```
 
 `--model {moe|dense}` (default `moe`) picks the Qwen line and must match the
-running stack — start it first (`make start35` MoE / `make start` dense); the two
-stacks share one A10 + host `:4000`, so only one runs at a time and switching
-lines is a manual cold swap, not automatic. opencode ignores `OPENAI_BASE_URL`
+running stack. The context cap must match too: `opencode-qwen` defaults to the **1× A10**
+stacks (`make start35` MoE / `make start` dense, 128k/64k ctx); for the **2× A10 TP=2**
+stacks (`make start35_tp2` MoE / `make start_tp2` dense, 256k ctx) use the `opencode-qwen-2`
+shim (or `QWEN_CTX_MODE=2x`). All stacks share one A10 + host
+`:4000`, so only one runs at a time — switching is a manual cold swap. opencode ignores `OPENAI_BASE_URL`
 for its built-in `openai` provider, so the wrapper hands it a dedicated
 openai-compatible provider by embedding the `litellm` provider config (baseURL,
 apiKey, the line's three model variants with context/output limits) as a static
@@ -873,7 +882,9 @@ and works unchanged from the `~/bin` copy. Pick the line with `--model
 {moe|dense}` and the flavor with `QWEN_FLAVOR` (default|preserve|nothink), or
 switch mid-session via `/model litellm/qwen3.6-<line>[-preserve|-nothink]`; the
 `-nothink` variant is the config's `small_model`. Context/output caps match the
-proxy (`limit.context` 64k dense / 128k MoE, `limit.output` 8192 dense / 16384 MoE). Drive a
+running stack (`limit.context` 64k dense / 128k MoE by default on 1×, or 256k under
+`opencode-qwen-2`; `limit.output` 8192 dense / 16384 MoE on 1×, 16384 dense / 32768 MoE
+on the 2× stack). Drive a
 remote box with `OPENCODE_QWEN_BASE_URL=http://<ip-or-hostname>:4000 ./bin/opencode-qwen`
 (`<ip-or-hostname>` is the box's LAN IP or hostname; the wrapper exports the localhost
 default itself; opencode has no

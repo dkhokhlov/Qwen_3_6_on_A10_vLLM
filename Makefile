@@ -33,7 +33,7 @@ stop35: ## Stop the 35B MoE stack (containers kept, not removed)
 run_tp2: ## Start the 27B dense TP=2 stack in the foreground, sharded across BOTH A10s (Ctrl-C to stop)
 	docker compose -f docker-compose.tp2.yaml up
 
-start_tp2: ## Start the 27B dense TP=2 stack detached, sharded across BOTH A10s (128k ctx)
+start_tp2: ## Start the 27B dense TP=2 stack detached, sharded across BOTH A10s (256k ctx)
 	docker compose -f docker-compose.tp2.yaml up -d
 
 stop_tp2: ## Stop the 27B dense TP=2 stack (containers kept, not removed)

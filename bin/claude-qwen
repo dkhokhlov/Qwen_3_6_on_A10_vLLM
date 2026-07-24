@@ -9,6 +9,10 @@
 #           One A10 + one host :4000 -> only one stack runs at a time, so switching
 #           lines is a manual cold swap (make stop/start35), NOT automatic. This
 #           wrapper does NOT start the stack -- run the matching `make` target first.
+# Stack   = context cap must match too. Default is single-A10 (dense 64k, moe 128k);
+#           QWEN_CTX_MODE=2x (or the claude-qwen-2 shim) selects 2xA10 TP=2 (256k). A
+#           256k cap on a 1x stack makes compaction fire past the real wall -> overflow.
+#           See the CTX_WINDOW block below.
 # Flavor  = QWEN_FLAVOR (default | preserve | nothink); empty/default = strip.
 #           Switch mid-session with /model qwen3.6-<line>[-preserve|-nothink].
 # ANTHROPIC_SMALL_FAST_MODEL is always the -nothink variant (bg tasks never reason).
@@ -34,11 +38,24 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Per-model BASE + the single-A10 (1x) DEFAULT context window and output cap. The window
+# MUST equal each model's 1x compose --max-model-len (moe 128k / dense 64k): compaction
+# is calibrated to PCT=80% of it, so a wrong value fires past the real wall and the
+# request overflows. cap <= WINDOW/5 (PCT=80): 128k -> 25600, 64k -> 12800.
 case "$MODEL" in
   moe)   BASE="qwen3.6-35b-a3b"; CTX_WINDOW=128000; MAX_OUTPUT=16384 ;;
   dense) BASE="qwen3.6-27b";     CTX_WINDOW=64000;  MAX_OUTPUT=8192  ;;
   *) echo "claude-qwen: --model must be 'moe' or 'dense' (got '$MODEL')" >&2; exit 2 ;;
 esac
+
+# 2xA10 TP=2 override (the claude-qwen-2 shim sets QWEN_CTX_MODE=2x): lift the window to
+# 256k (both models) and the output cap to moe 32k / dense 16k. 256k -> WINDOW/5 = 51200,
+# so 32k leaves ~18k of cap headroom. 1x stays the safe default: it under-uses context on
+# a 2x stack rather than overflowing on a 1x stack.
+if [[ "${QWEN_CTX_MODE:-1x}" == "2x" ]]; then
+  CTX_WINDOW=256000
+  case "$MODEL" in moe) MAX_OUTPUT=32768 ;; dense) MAX_OUTPUT=16384 ;; esac
+fi
 
 case "${QWEN_FLAVOR:-default}" in
   default)  FLAVOR="" ;;

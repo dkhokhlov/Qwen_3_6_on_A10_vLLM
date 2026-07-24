@@ -133,7 +133,7 @@ services:
       WAKE_TIMEOUT_SECONDS: "${VLLM_WAKE_TIMEOUT:-300}"
       LITELLM_WORKER_STARTUP_HOOKS: litellm_callbacks:start_background_tasks
       PYTHONPATH: /app
-      CLAUDE_QWEN_MAX_TOKENS_CAP: "16384"   # server-side clamp (kept at TP=1 value; 256k window allows up to 51200). TODO: bump to use TP=2 headroom if desired
+      CLAUDE_QWEN_MAX_TOKENS_CAP: "32768"   # server-side clamp for subagents/small-fast (MoE TP=2): matches the *-qwen-2 wrappers' 32k output cap; 256k window allows up to 51200
       CLAUDE_QWEN_INJECT_STREAMED_USAGE: "1"   # preflight /tokenize -> message_start.input_tokens (auto-compact)
       CLAUDE_QWEN_PROXY_COMPACT: "0"           # opt-in proxy-side compaction (compact_20260112 polyfill); 0=off (default, claude's own auto-compact), 1=inject context_management on /v1/messages for REPEATED server-side compaction past the per-session breaker
       CLAUDE_QWEN_PROXY_COMPACT_THRESHOLD: "90000"  # input-token trigger (kept at TP=1 value; 256k window has ample headroom). TODO: bump to use TP=2 headroom if desired
