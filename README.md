@@ -833,7 +833,7 @@ make start   && ./bin/claude-qwen --model dense    # 27B dense stack
 `--model {moe|dense}` (default `moe`) picks the Qwen line and must match the
 running stack. The context cap must match too: `claude-qwen` defaults to the **1× A10**
 stacks (`make start35` MoE / `make start` dense, 128k/64k ctx); for the **2× A10 TP=2**
-stacks (`make start35_tp2` MoE / `make start_tp2` dense, 256k ctx) use the `claude-qwen-2`
+stacks (`make start35-tp2` MoE / `make start-tp2` dense, 256k ctx) use the `claude-qwen-2`
 shim (or `QWEN_CTX_MODE=2x`) — a 256k cap on a 1× stack overflows.
 All stacks share one A10 + host `:4000`, so only one runs at a time — switching is a
 manual cold swap. `claude-qwen` points Claude Code at the proxy
@@ -867,7 +867,7 @@ make start   && ./bin/opencode-qwen --model dense    # 27B dense stack
 `--model {moe|dense}` (default `moe`) picks the Qwen line and must match the
 running stack. The context cap must match too: `opencode-qwen` defaults to the **1× A10**
 stacks (`make start35` MoE / `make start` dense, 128k/64k ctx); for the **2× A10 TP=2**
-stacks (`make start35_tp2` MoE / `make start_tp2` dense, 256k ctx) use the `opencode-qwen-2`
+stacks (`make start35-tp2` MoE / `make start-tp2` dense, 256k ctx) use the `opencode-qwen-2`
 shim (or `QWEN_CTX_MODE=2x`). All stacks share one A10 + host
 `:4000`, so only one runs at a time — switching is a manual cold swap. opencode ignores `OPENAI_BASE_URL`
 for its built-in `openai` provider, so the wrapper hands it a dedicated
